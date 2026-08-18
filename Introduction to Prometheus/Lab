@@ -1,0 +1,285 @@
+Introduction to Prometheus
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the core architecture and components of Prometheus monitoring system
+Install and configure Prometheus server on a Linux machine
+Configure Prometheus to scrape metrics from targets
+Verify that Prometheus is successfully collecting and storing metrics
+Navigate the Prometheus web interface to query and visualize metrics
+Understand the fundamentals of PromQL (Prometheus Query Language)
+Prerequisites
+Before starting this lab, you should have:
+
+Basic knowledge of Linux command line operations
+Understanding of basic networking concepts (ports, HTTP)
+Familiarity with YAML configuration files
+Basic understanding of monitoring and metrics concepts
+Lab Environment
+Al Nafi provides you with a ready-to-use Linux-based cloud machine. Simply click Start Lab to access your environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during this lab exercise.
+
+Lab Overview
+Prometheus is an open-source monitoring and alerting toolkit designed for reliability and scalability. It collects metrics from configured targets at given intervals, evaluates rule expressions, displays results, and can trigger alerts when specified conditions are observed.
+
+Key Components of Prometheus:
+Prometheus Server: Scrapes and stores time series data
+Client Libraries: For instrumenting application code
+Push Gateway: For supporting short-lived jobs
+Exporters: For exposing metrics from third-party systems
+Alertmanager: For handling alerts
+Task 1: Install Prometheus
+Step 1.1: Update System Packages
+First, ensure your system is up to date:
+
+sudo apt update && sudo apt upgrade -y
+Step 1.2: Create Prometheus User
+Create a dedicated user for running Prometheus:
+
+sudo useradd --no-create-home --shell /bin/false prometheus
+Step 1.3: Create Required Directories
+Create directories for Prometheus configuration and data:
+
+sudo mkdir /etc/prometheus
+sudo mkdir /var/lib/prometheus
+Set proper ownership:
+
+sudo chown prometheus:prometheus /etc/prometheus
+sudo chown prometheus:prometheus /var/lib/prometheus
+Step 1.4: Download and Install Prometheus
+Navigate to the temporary directory and download Prometheus:
+
+cd /tmp
+wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
+Extract the downloaded archive:
+
+tar xvf prometheus-2.47.0.linux-amd64.tar.gz
+cd prometheus-2.47.0.linux-amd64
+Copy the binaries to the appropriate locations:
+
+sudo cp prometheus /usr/local/bin/
+sudo cp promtool /usr/local/bin/
+Set proper ownership and permissions:
+
+sudo chown prometheus:prometheus /usr/local/bin/prometheus
+sudo chown prometheus:prometheus /usr/local/bin/promtool
+Copy configuration files:
+
+sudo cp -r consoles /etc/prometheus
+sudo cp -r console_libraries /etc/prometheus
+Set ownership for configuration directories:
+
+sudo chown -R prometheus:prometheus /etc/prometheus/consoles
+sudo chown -R prometheus:prometheus /etc/prometheus/console_libraries
+Step 1.5: Verify Installation
+Check if Prometheus is installed correctly:
+
+prometheus --version
+You should see output similar to:
+
+prometheus, version 2.47.0 (branch: HEAD, revision: 7f8e09f)
+Task 2: Configure Prometheus Server
+Step 2.1: Create Prometheus Configuration File
+Create the main configuration file for Prometheus:
+
+sudo nano /etc/prometheus/prometheus.yml
+Add the following configuration:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+Save and exit the file (Ctrl+X, then Y, then Enter).
+
+Step 2.2: Set Configuration File Ownership
+Set proper ownership for the configuration file:
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Step 2.3: Create Systemd Service File
+Create a systemd service file for Prometheus:
+
+sudo nano /etc/systemd/system/prometheus.service
+Add the following content:
+
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+Save and exit the file.
+
+Step 2.4: Install and Configure Node Exporter
+Download Node Exporter to provide system metrics:
+
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+Extract and install:
+
+tar xvf node_exporter-1.6.1.linux-amd64.tar.gz
+sudo cp node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+Create a user for Node Exporter:
+
+sudo useradd --no-create-home --shell /bin/false node_exporter
+sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+Create a systemd service for Node Exporter:
+
+sudo nano /etc/systemd/system/node_exporter.service
+Add the following content:
+
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+Save and exit the file.
+
+Task 3: Verify Prometheus is Collecting Metrics
+Step 3.1: Start Services
+Reload systemd and start the services:
+
+sudo systemctl daemon-reload
+sudo systemctl start node_exporter
+sudo systemctl start prometheus
+Enable services to start on boot:
+
+sudo systemctl enable node_exporter
+sudo systemctl enable prometheus
+Step 3.2: Check Service Status
+Verify that both services are running:
+
+sudo systemctl status prometheus
+sudo systemctl status node_exporter
+Both services should show active (running) status.
+
+Step 3.3: Verify Port Accessibility
+Check if Prometheus and Node Exporter are listening on their respective ports:
+
+sudo netstat -tlnp | grep :9090
+sudo netstat -tlnp | grep :9100
+You should see both ports in the LISTEN state.
+
+Step 3.4: Test Metrics Collection
+Test if Node Exporter is providing metrics:
+
+curl http://localhost:9100/metrics | head -20
+You should see various system metrics being exposed.
+
+Test if Prometheus is accessible:
+
+curl http://localhost:9090/api/v1/targets
+This should return JSON data showing the configured targets.
+
+Step 3.5: Access Prometheus Web Interface
+Since you're working on a single machine, you can use a text-based browser to verify the web interface:
+
+sudo apt install -y lynx
+lynx http://localhost:9090
+Navigate through the interface using arrow keys. You should see:
+
+The Prometheus web interface
+Status > Targets page showing both prometheus and node_exporter targets as UP
+Step 3.6: Query Metrics Using PromQL
+Test some basic PromQL queries using curl:
+
+Query to check Prometheus server uptime:
+
+curl -G http://localhost:9090/api/v1/query --data-urlencode 'query=up'
+Query to check CPU usage:
+
+curl -G http://localhost:9090/api/v1/query --data-urlencode 'query=100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)'
+Query to check memory usage:
+
+curl -G http://localhost:9090/api/v1/query --data-urlencode 'query=node_memory_MemAvailable_bytes'
+Step 3.7: Verify Data Storage
+Check if Prometheus is storing data:
+
+sudo ls -la /var/lib/prometheus/
+You should see directories and files created by Prometheus for storing time-series data.
+
+Step 3.8: View Configuration
+Verify your configuration is loaded correctly:
+
+curl http://localhost:9090/api/v1/status/config
+This will show the current configuration that Prometheus is using.
+
+Troubleshooting Tips
+Common Issues and Solutions:
+Service fails to start:
+
+Check service logs: sudo journalctl -u prometheus -f
+Verify file permissions and ownership
+Check configuration file syntax: promtool check config /etc/prometheus/prometheus.yml
+Targets showing as DOWN:
+
+Verify services are running: sudo systemctl status node_exporter
+Check if ports are accessible: netstat -tlnp | grep 9100
+Review firewall settings if applicable
+Permission denied errors:
+
+Ensure proper ownership: sudo chown -R prometheus:prometheus /etc/prometheus/
+Check directory permissions: ls -la /var/lib/prometheus/
+Configuration errors:
+
+Validate YAML syntax: promtool check config /etc/prometheus/prometheus.yml
+Check indentation in YAML files (use spaces, not tabs)
+Lab Verification Checklist
+Ensure you have completed the following:
+
+ Prometheus server is installed and running on port 9090
+ Node Exporter is installed and running on port 9100
+ Both services are enabled to start on boot
+ Prometheus configuration file is properly formatted
+ Both targets (prometheus and node_exporter) show as UP in targets page
+ Metrics queries return valid data
+ Time-series data is being stored in /var/lib/prometheus/
+Conclusion
+Congratulations! You have successfully completed the Introduction to Prometheus lab. In this lab, you have:
+
+Installed Prometheus monitoring server and Node Exporter on a single Linux machine
+Configured Prometheus to scrape metrics from itself and the local system
+Verified metric collection by checking service status, querying APIs, and examining stored data
+Learned basic PromQL queries to retrieve and analyze metrics
+Set up systemd services for automatic startup and management
+This foundation provides you with a working Prometheus setup that can be extended to monitor additional services and applications. Prometheus is now collecting system metrics every 15 seconds and storing them for analysis and alerting.
+
+Why This Matters: Monitoring is crucial for maintaining healthy systems in production environments. Prometheus provides a robust, scalable solution for collecting, storing, and querying metrics. The skills you've learned here form the foundation for implementing comprehensive monitoring solutions in real-world scenarios.
+
+Next Steps: With this basic setup, you can now explore advanced Prometheus features such as:
+
+Adding more exporters for different services
+Creating custom metrics and alerts
+Setting up Grafana for advanced visualization
+Implementing alerting rules and notifications
