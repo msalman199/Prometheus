@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dynamic-service
+  namespace: demo-apps
+  labels:
+    app: dynamic-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dynamic-service
+  template:
+    metadata:
+      labels:
+        app: dynamic-service
+        tier: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/health/metrics"
+    spec:
+      containers:
+      - name: dynamic-app
+        image: nginx:alpine
+        ports:
+        - containerPort: 80
+        - containerPort: 8080
+          name: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dynamic-service
+  namespace: demo-apps
+  labels:
+    app: dynamic-service
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/health/metrics"
+spec:
+  selector:
+    app: dynamic-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+  type: ClusterIP
