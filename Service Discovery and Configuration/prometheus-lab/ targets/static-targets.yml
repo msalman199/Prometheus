@@ -1,0 +1,16 @@
+- targets:
+  - 'localhost:9090'
+  - 'localhost:9100'
+  - 'localhost:8080'
+  labels:
+    job: 'static-services'
+    environment: 'development'
+    team: 'platform'
+
+- targets:
+  - 'localhost:3000'
+  - 'localhost:8000'
+  labels:
+    job: 'web-services'
+    environment: 'development'
+    team: 'frontend'
