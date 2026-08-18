@@ -1,0 +1,448 @@
+ Prometheus Architecture Overview
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the core components of Prometheus architecture and their roles
+Set up and configure a Prometheus server from scratch
+Install and configure various exporters to collect system metrics
+Configure Alertmanager for handling alerts
+Write and execute basic PromQL queries
+Navigate and utilize the Prometheus web UI effectively
+Understand how all Prometheus components interact in a monitoring ecosystem
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Linux command line operations
+Familiarity with text editors (nano, vim, or similar)
+Understanding of basic networking concepts (ports, HTTP)
+Knowledge of YAML file format
+Basic understanding of monitoring and metrics concepts
+Lab Environment
+Al Nafi provides you with a Linux-based cloud machine. Simply click Start Lab to access your environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during this lab.
+
+Task 1: Set up Prometheus Server
+Subtask 1.1: Prepare the System and Install Dependencies
+First, update your system and install necessary dependencies:
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install wget curl tar -y
+Create a dedicated user for Prometheus:
+
+sudo useradd --no-create-home --shell /bin/false prometheus
+Create necessary directories:
+
+sudo mkdir /etc/prometheus
+sudo mkdir /var/lib/prometheus
+sudo chown prometheus:prometheus /etc/prometheus
+sudo chown prometheus:prometheus /var/lib/prometheus
+Subtask 1.2: Download and Install Prometheus
+Download the latest Prometheus release:
+
+cd /tmp
+wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
+tar xvf prometheus-2.47.0.linux-amd64.tar.gz
+cd prometheus-2.47.0.linux-amd64
+Copy binaries to appropriate locations:
+
+sudo cp prometheus /usr/local/bin/
+sudo cp promtool /usr/local/bin/
+sudo chown prometheus:prometheus /usr/local/bin/prometheus
+sudo chown prometheus:prometheus /usr/local/bin/promtool
+Copy configuration files:
+
+sudo cp -r consoles /etc/prometheus
+sudo cp -r console_libraries /etc/prometheus
+sudo chown -R prometheus:prometheus /etc/prometheus/consoles
+sudo chown -R prometheus:prometheus /etc/prometheus/console_libraries
+Subtask 1.3: Create Prometheus Configuration
+Create the main Prometheus configuration file:
+
+sudo nano /etc/prometheus/prometheus.yml
+Add the following configuration:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - localhost:9093
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+
+  - job_name: 'process-exporter'
+    static_configs:
+      - targets: ['localhost:9256']
+Set proper ownership:
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Subtask 1.4: Create Prometheus Service
+Create a systemd service file:
+
+sudo nano /etc/systemd/system/prometheus.service
+Add the following content:
+
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+Enable and start the Prometheus service:
+
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus
+sudo systemctl start prometheus
+sudo systemctl status prometheus
+Verify Prometheus is running:
+
+curl http://localhost:9090/metrics
+Task 2: Understand the Role of Exporters, Alertmanager, and PromQL
+Subtask 2.1: Install and Configure Node Exporter
+Node Exporter collects hardware and OS metrics. Download and install it:
+
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+tar xvf node_exporter-1.6.1.linux-amd64.tar.gz
+cd node_exporter-1.6.1.linux-amd64
+sudo cp node_exporter /usr/local/bin/
+Create a user for node exporter:
+
+sudo useradd --no-create-home --shell /bin/false node_exporter
+sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+Create a systemd service for node exporter:
+
+sudo nano /etc/systemd/system/node_exporter.service
+Add the following content:
+
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+Start and enable node exporter:
+
+sudo systemctl daemon-reload
+sudo systemctl enable node_exporter
+sudo systemctl start node_exporter
+sudo systemctl status node_exporter
+Verify node exporter is working:
+
+curl http://localhost:9100/metrics | head -20
+Subtask 2.2: Install and Configure Process Exporter
+Process Exporter monitors running processes. Install it:
+
+cd /tmp
+wget https://github.com/ncabatoff/process-exporter/releases/download/v0.7.10/process-exporter-0.7.10.linux-amd64.tar.gz
+tar xvf process-exporter-0.7.10.linux-amd64.tar.gz
+cd process-exporter-0.7.10.linux-amd64
+sudo cp process-exporter /usr/local/bin/
+Create user and set permissions:
+
+sudo useradd --no-create-home --shell /bin/false process_exporter
+sudo chown process_exporter:process_exporter /usr/local/bin/process-exporter
+Create configuration directory and file:
+
+sudo mkdir /etc/process-exporter
+sudo nano /etc/process-exporter/config.yml
+Add the following configuration:
+
+process_names:
+  - name: "{{.Comm}}"
+    cmdline:
+    - '.+'
+Set ownership:
+
+sudo chown -R process_exporter:process_exporter /etc/process-exporter
+Create systemd service:
+
+sudo nano /etc/systemd/system/process_exporter.service
+Add the following content:
+
+[Unit]
+Description=Process Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=process_exporter
+Group=process_exporter
+Type=simple
+ExecStart=/usr/local/bin/process-exporter --config.path /etc/process-exporter/config.yml
+
+[Install]
+WantedBy=multi-user.target
+Start and enable process exporter:
+
+sudo systemctl daemon-reload
+sudo systemctl enable process_exporter
+sudo systemctl start process_exporter
+sudo systemctl status process_exporter
+Verify process exporter:
+
+curl http://localhost:9256/metrics | grep process
+Subtask 2.3: Install and Configure Alertmanager
+Alertmanager handles alerts sent by Prometheus. Download and install it:
+
+cd /tmp
+wget https://github.com/prometheus/alertmanager/releases/download/v0.26.0/alertmanager-0.26.0.linux-amd64.tar.gz
+tar xvf alertmanager-0.26.0.linux-amd64.tar.gz
+cd alertmanager-0.26.0.linux-amd64
+Create user and directories:
+
+sudo useradd --no-create-home --shell /bin/false alertmanager
+sudo mkdir /etc/alertmanager
+sudo mkdir /var/lib/alertmanager
+Copy binaries and set permissions:
+
+sudo cp alertmanager /usr/local/bin/
+sudo cp amtool /usr/local/bin/
+sudo chown alertmanager:alertmanager /usr/local/bin/alertmanager
+sudo chown alertmanager:alertmanager /usr/local/bin/amtool
+sudo chown alertmanager:alertmanager /etc/alertmanager
+sudo chown alertmanager:alertmanager /var/lib/alertmanager
+Create Alertmanager configuration:
+
+sudo nano /etc/alertmanager/alertmanager.yml
+Add the following configuration:
+
+global:
+  smtp_smarthost: 'localhost:587'
+  smtp_from: 'alertmanager@example.com'
+
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'web.hook'
+
+receivers:
+- name: 'web.hook'
+  webhook_configs:
+  - url: 'http://127.0.0.1:5001/'
+Set ownership:
+
+sudo chown alertmanager:alertmanager /etc/alertmanager/alertmanager.yml
+Create systemd service:
+
+sudo nano /etc/systemd/system/alertmanager.service
+Add the following content:
+
+[Unit]
+Description=Alertmanager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=alertmanager
+Group=alertmanager
+Type=simple
+ExecStart=/usr/local/bin/alertmanager \
+    --config.file /etc/alertmanager/alertmanager.yml \
+    --storage.path /var/lib/alertmanager/ \
+    --web.listen-address=0.0.0.0:9093
+
+[Install]
+WantedBy=multi-user.target
+Start and enable Alertmanager:
+
+sudo systemctl daemon-reload
+sudo systemctl enable alertmanager
+sudo systemctl start alertmanager
+sudo systemctl status alertmanager
+Subtask 2.4: Create Alert Rules
+Create alert rules for Prometheus:
+
+sudo nano /etc/prometheus/alert_rules.yml
+Add the following alert rules:
+
+groups:
+- name: basic_alerts
+  rules:
+  - alert: InstanceDown
+    expr: up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Instance {{ $labels.instance }} down"
+      description: "{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute."
+
+  - alert: HighCPUUsage
+    expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage on {{ $labels.instance }}"
+      description: "CPU usage is above 80% for more than 2 minutes on {{ $labels.instance }}"
+
+  - alert: HighMemoryUsage
+    expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 85
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage on {{ $labels.instance }}"
+      description: "Memory usage is above 85% for more than 2 minutes on {{ $labels.instance }}"
+Set ownership and restart Prometheus:
+
+sudo chown prometheus:prometheus /etc/prometheus/alert_rules.yml
+sudo systemctl restart prometheus
+Task 3: Explore the Prometheus UI
+Subtask 3.1: Access the Prometheus Web Interface
+Open your web browser and navigate to the Prometheus UI. Since you're working on a single machine, you can access it via:
+
+# Check if Prometheus is accessible
+curl -I http://localhost:9090
+If you need to access it from outside the machine, you can use port forwarding or check the machine's IP:
+
+ip addr show | grep inet
+The Prometheus UI should be accessible at http://[YOUR_IP]:9090
+
+Subtask 3.2: Explore Basic PromQL Queries
+Navigate to the Graph tab in the Prometheus UI and try these basic PromQL queries:
+
+Query 1: Check all targets status
+
+up
+Query 2: CPU usage percentage
+
+100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+Query 3: Memory usage percentage
+
+(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100
+Query 4: Disk usage
+
+node_filesystem_avail_bytes{fstype!="tmpfs"}
+Query 5: Network traffic
+
+rate(node_network_receive_bytes_total[5m])
+Subtask 3.3: Explore the Status Menu
+Navigate through different sections of the Prometheus UI:
+
+Status > Targets: View all configured scrape targets and their health
+Status > Configuration: View the current Prometheus configuration
+Status > Rules: View loaded alerting and recording rules
+Status > Service Discovery: View discovered targets
+Alerts: View active alerts and their status
+Subtask 3.4: Test Alert Functionality
+Create a simple script to generate high CPU usage to trigger alerts:
+
+nano cpu_stress.sh
+Add the following content:
+
+#!/bin/bash
+echo "Starting CPU stress test..."
+for i in {1..4}; do
+    yes > /dev/null &
+done
+echo "CPU stress test started. Run 'killall yes' to stop."
+Make it executable and run:
+
+chmod +x cpu_stress.sh
+./cpu_stress.sh
+Wait for 2-3 minutes and check the Alerts tab in Prometheus UI to see if the HighCPUUsage alert fires.
+
+Stop the stress test:
+
+killall yes
+Subtask 3.5: Verify Component Interaction
+Check that all components are communicating properly:
+
+Verify Prometheus can scrape all targets:
+
+curl -s http://localhost:9090/api/v1/targets | grep -o '"health":"[^"]*"' | sort | uniq -c
+Check Alertmanager connectivity:
+
+curl -s http://localhost:9090/api/v1/alertmanagers
+Verify metrics are being collected:
+
+curl -s http://localhost:9090/api/v1/query?query=up | grep -o '"value":\[[^]]*\]'
+Troubleshooting Tips
+Common Issues and Solutions
+Issue 1: Service fails to start
+
+Check service status: sudo systemctl status [service-name]
+View logs: sudo journalctl -u [service-name] -f
+Verify file permissions and ownership
+Issue 2: Targets showing as down
+
+Verify the service is running on the expected port
+Check firewall settings: sudo ufw status
+Test connectivity: curl http://localhost:[port]/metrics
+Issue 3: Configuration errors
+
+Validate YAML syntax: promtool check config /etc/prometheus/prometheus.yml
+Check for indentation issues in YAML files
+Verify file paths and permissions
+Issue 4: Alerts not firing
+
+Check alert rule syntax: promtool check rules /etc/prometheus/alert_rules.yml
+Verify evaluation interval in prometheus.yml
+Check if conditions are actually met
+Issue 5: High resource usage
+
+Monitor Prometheus metrics about itself
+Adjust scrape intervals if needed
+Check retention settings
+Verification Commands
+Run these commands to verify your setup:
+
+# Check all services are running
+sudo systemctl status prometheus node_exporter process_exporter alertmanager
+
+# Verify all ports are listening
+sudo netstat -tlnp | grep -E ':(9090|9100|9256|9093)'
+
+# Test metric collection
+curl -s http://localhost:9090/api/v1/query?query=up | jq .
+
+# Check target health
+curl -s http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {job: .labels.job, health: .health}'
+Conclusion
+In this lab, you have successfully:
+
+Set up a complete Prometheus monitoring stack on a single Linux machine, including the Prometheus server, Node Exporter, Process Exporter, and Alertmanager
+Understood the architecture and how each component plays a specific role in the monitoring ecosystem
+Configured exporters to collect system and process metrics, demonstrating how Prometheus gathers data from various sources
+Implemented alerting with Alertmanager and created meaningful alert rules for system monitoring
+Explored PromQL by writing and executing queries to extract insights from collected metrics
+Navigated the Prometheus UI to visualize data, monitor targets, and manage alerts
+This hands-on experience demonstrates how Prometheus components work together to create a comprehensive monitoring solution. The Prometheus server acts as the central hub, exporters provide specialized metrics, Alertmanager handles alert routing and notifications, and PromQL enables powerful data analysis. Understanding this architecture is crucial for implementing effective monitoring in production environments.
+
+The skills you've developed in this lab form the foundation for more advanced Prometheus deployments, including service discovery, federation, and integration with visualization tools like Grafana.
