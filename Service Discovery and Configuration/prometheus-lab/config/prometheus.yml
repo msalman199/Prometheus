@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # Static configuration for Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # File-based service discovery
+  - job_name: 'file-based-discovery'
+    file_sd_configs:
+      - files:
+          - '/etc/prometheus/targets/*.yml'
+        refresh_interval: 30s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [job]
+        target_label: service_type
+
+  # Static targets for demonstration
+  - job_name: 'static-demo'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+          tier: 'monitoring'
