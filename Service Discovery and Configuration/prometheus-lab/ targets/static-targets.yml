@@ -14,3 +14,11 @@
     job: 'web-services'
     environment: 'development'
     team: 'frontend'
+- targets:
+  - 'localhost:8080'
+  - 'localhost:3000'
+  - 'localhost:8000'
+  labels:
+    job: 'mock-services'
+    environment: 'development'
+    discovery_type: 'static'
