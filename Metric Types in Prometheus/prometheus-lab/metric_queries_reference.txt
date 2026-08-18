@@ -1,0 +1,21 @@
+# Counter Queries
+http_requests_total
+rate(http_requests_total[5m])
+sum by (endpoint) (http_requests_total)
+
+# Gauge Queries
+cpu_usage_percent
+avg_over_time(cpu_usage_percent[10m])
+max_over_time(memory_usage_bytes[10m])
+
+# Histogram Queries
+histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m])
+
+# Summary Queries
+http_request_latency_seconds{quantile="0.95"}
+rate(data_processing_seconds_count[5m])
+
+# Complex Queries
+(sum(rate(http_errors_total[5m])) / sum(rate(http_requests_total[5m]))) * 100
+(rate(http_request_duration_seconds_bucket{le="1.0"}[5m]) / rate(http_request_duration_seconds_count[5m])) * 100
