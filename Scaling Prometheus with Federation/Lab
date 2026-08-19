@@ -1,0 +1,498 @@
+Scaling Prometheus with Federation
+Objectives
+Design and operate a hierarchical Prometheus federation topology in which a global aggregator scrapes selected metrics from two independent cluster-level Prometheus instances
+Author PromQL recording rules and alerting rules on the global instance that aggregate cross-cluster signals into unified time series
+Diagnose label collision, cardinality, and scrape-lag problems that arise specifically in federated architectures
+Prerequisites
+Comfort with Linux process management, systemd unit files, and reading structured log output
+Familiarity with YAML syntax and HTTP-based APIs (curl, status codes, response bodies)
+Prior exposure to basic PromQL concepts: selectors, rate(), sum(), and label matchers
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Provision the Monitoring Stack
+Step 1.1 â Install Prometheus and Node Exporter binaries
+Your environment requires three independent Prometheus processes (two cluster-level, one global aggregator) and two Node Exporter processes, all running on the same host at distinct ports. Install the Prometheus server binary, the promtool configuration validator, and the Node Exporter binary from the official GitHub releases. Create a dedicated prometheus system user with no login shell, and establish the directory layout shown below before placing any binaries or configuration files.
+
+/usr/local/bin/
+    prometheus
+    promtool
+    node_exporter
+
+/etc/prometheus/
+    cluster-a/
+    cluster-b/
+    federation/
+
+/var/lib/prometheus/
+    cluster-a/
+    cluster-b/
+    federation/
+All directories under /etc/prometheus/ and /var/lib/prometheus/ must be owned by the prometheus user.
+
+# Official release index: https://github.com/prometheus/prometheus/releases
+# Official Node Exporter release index: https://github.com/prometheus/node_exporter/releases
+
+PROM_VERSION="2.52.0"
+NE_VERSION="1.8.1"
+ARCH="linux-amd64"
+
+sudo useradd --no-create-home --shell /bin/false prometheus
+
+for d in /etc/prometheus/cluster-a /etc/prometheus/cluster-b /etc/prometheus/federation \
+          /var/lib/prometheus/cluster-a /var/lib/prometheus/cluster-b /var/lib/prometheus/federation; do
+    sudo mkdir -p "$d"
+done
+
+cd /tmp
+
+wget -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.${ARCH}.tar.gz" \
+     -O prometheus.tar.gz
+# If this URL fails, visit https://prometheus.io/download/ for the current release URL.
+
+tar xf prometheus.tar.gz
+sudo cp "prometheus-${PROM_VERSION}.${ARCH}/prometheus" /usr/local/bin/
+sudo cp "prometheus-${PROM_VERSION}.${ARCH}/promtool"   /usr/local/bin/
+sudo cp -r "prometheus-${PROM_VERSION}.${ARCH}/consoles"         /etc/prometheus/
+sudo cp -r "prometheus-${PROM_VERSION}.${ARCH}/console_libraries" /etc/prometheus/
+
+wget -fsSL "https://github.com/prometheus/node_exporter/releases/download/v${NE_VERSION}/node_exporter-${NE_VERSION}.${ARCH}.tar.gz" \
+     -O node_exporter.tar.gz
+# If this URL fails, visit https://prometheus.io/download/#node_exporter for the current release URL.
+
+tar xf node_exporter.tar.gz
+sudo cp "node_exporter-${NE_VERSION}.${ARCH}/node_exporter" /usr/local/bin/
+
+sudo chown prometheus:prometheus /usr/local/bin/prometheus \
+                                  /usr/local/bin/promtool \
+                                  /usr/local/bin/node_exporter
+sudo chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+Troubleshoot this step:
+
+wget: unable to resolve host 'github.com' â the instance has no outbound DNS or internet access.
+Confirm outbound connectivity with curl -fsSL https://github.com and check your EC2 security group for outbound rules.
+https://prometheus.io/download/
+Step 1.2 â Write configuration files and create systemd units
+Each cluster-level Prometheus instance must scrape its own process metrics and the Node Exporter running on its designated port. The global federation instance must not scrape any application targets directly; it must only pull from the /federate endpoints of the two cluster instances. All three instances must be managed as systemd services that restart on failure.
+
+Port assignments:
+
+Instance	Prometheus port	Node Exporter port
+Cluster A	9090	9100
+Cluster B	9091	9101
+Federation	9092	â
+Write the three Prometheus configuration files, the two Node Exporter unit files, and the three Prometheus unit files. Validate every configuration file with promtool check config before enabling any service.
+
+# --- Cluster A configuration ---
+sudo tee /etc/prometheus/cluster-a/prometheus.yml > /dev/null <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "cluster-a"
+    region: "us-east-1"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9100"]
+EOF
+
+# --- Cluster B configuration ---
+sudo tee /etc/prometheus/cluster-b/prometheus.yml > /dev/null <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: "cluster-b"
+    region: "us-west-2"
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9091"]
+
+  - job_name: "node"
+    static_configs:
+      - targets: ["localhost:9101"]
+EOF
+
+# --- Federation configuration (rules file referenced but not yet created) ---
+sudo tee /etc/prometheus/federation/prometheus.yml > /dev/null <<'EOF'
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    monitor: "global-federation"
+
+rule_files:
+  - "rules.yml"
+
+scrape_configs:
+  - job_name: "federate-cluster-a"
+    honor_labels: true
+    metrics_path: "/federate"
+    params:
+      "match[]":
+        - '{__name__=~"up|node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_filesystem_avail_bytes|prometheus_tsdb_head_series"}'
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "federate-cluster-b"
+    honor_labels: true
+    metrics_path: "/federate"
+    params:
+      "match[]":
+        - '{__name__=~"up|node_cpu_seconds_total|node_memory_MemAvailable_bytes|node_filesystem_avail_bytes|prometheus_tsdb_head_series"}'
+    static_configs:
+      - targets: ["localhost:9091"]
+EOF
+
+# Create a placeholder rules file so promtool validation passes
+sudo tee /etc/prometheus/federation/rules.yml > /dev/null <<'EOF'
+groups: []
+EOF
+
+sudo chown -R prometheus:prometheus /etc/prometheus/cluster-a \
+                                     /etc/prometheus/cluster-b \
+                                     /etc/prometheus/federation
+
+# Validate all three configurations
+promtool check config /etc/prometheus/cluster-a/prometheus.yml
+promtool check config /etc/prometheus/cluster-b/prometheus.yml
+promtool check config /etc/prometheus/federation/prometheus.yml
+Troubleshoot this step:
+
+FAILED: parsing YAML file ...: yaml: line N: mapping values are not allowed in this context â a YAML indentation or quoting error exists in the configuration file.
+Run cat -A /etc/prometheus/federation/prometheus.yml to reveal hidden characters; compare indentation against the heredoc above and correct the offending line.
+https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+# --- Systemd unit: Node Exporter Cluster A ---
+sudo tee /etc/systemd/system/node-exporter-a.service > /dev/null <<'EOF'
+[Unit]
+Description=Node Exporter - Cluster A
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+Restart=on-failure
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9100
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- Systemd unit: Node Exporter Cluster B ---
+sudo tee /etc/systemd/system/node-exporter-b.service > /dev/null <<'EOF'
+[Unit]
+Description=Node Exporter - Cluster B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+Restart=on-failure
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:9101
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- Systemd unit: Prometheus Cluster A ---
+sudo tee /etc/systemd/system/prometheus-a.service > /dev/null <<'EOF'
+[Unit]
+Description=Prometheus - Cluster A
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+Restart=on-failure
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/cluster-a/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus/cluster-a \
+  --web.console.templates=/etc/prometheus/consoles \
+  --web.console.libraries=/etc/prometheus/console_libraries \
+  --web.listen-address=:9090 \
+  --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- Systemd unit: Prometheus Cluster B ---
+sudo tee /etc/systemd/system/prometheus-b.service > /dev/null <<'EOF'
+[Unit]
+Description=Prometheus - Cluster B
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+Restart=on-failure
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/cluster-b/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus/cluster-b \
+  --web.console.templates=/etc/prometheus/consoles \
+  --web.console.libraries=/etc/prometheus/console_libraries \
+  --web.listen-address=:9091 \
+  --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# --- Systemd unit: Prometheus Federation ---
+sudo tee /etc/systemd/system/prometheus-federation.service > /dev/null <<'EOF'
+[Unit]
+Description=Prometheus - Global Federation
+After=network-online.target prometheus-a.service prometheus-b.service
+Wants=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+Restart=on-failure
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/federation/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus/federation \
+  --web.console.templates=/etc/prometheus/consoles \
+  --web.console.libraries=/etc/prometheus/console_libraries \
+  --web.listen-address=:9092 \
+  --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+
+for svc in node-exporter-a node-exporter-b prometheus-a prometheus-b prometheus-federation; do
+    sudo systemctl enable --now "$svc"
+done
+Confirmation: All five services report active (running) when you run systemctl status node-exporter-a node-exporter-b prometheus-a prometheus-b prometheus-federation. Ports 9090, 9091, 9092, 9100, and 9101 appear in ss -tlnp output.
+
+Troubleshoot this step:
+
+prometheus-a.service: Main process exited, code=exited, status=2/INVALIDARGUMENT â a flag name or path in the ExecStart line is wrong.
+Retrieve the exact error with journalctl -u prometheus-a -n 30 --no-pager and cross-reference the flag name against prometheus --help.
+https://prometheus.io/docs/prometheus/latest/command-line/prometheus/
+Task 2: Implement the Federation Topology and Validate Cross-Cluster Metrics
+Step 2.1 â Confirm the /federate endpoint delivers labelled time series
+The /federate endpoint (a Prometheus-native HTTP endpoint that returns metrics in the Prometheus text exposition format) is the mechanism by which the global instance pulls a filtered subset of time series from each cluster instance. Before writing any rules, verify that the endpoint on each cluster instance returns time series that carry the cluster and region labels injected by external_labels.
+
+Your verification must satisfy all three of the following conditions:
+
+A raw HTTP request to http://localhost:9090/federate with a match[] parameter returns at least the up metric with a cluster="cluster-a" label present on every returned line.
+The same check against port 9091 returns cluster="cluster-b" on every returned line.
+A query against the global instance at port 9092 for the metric up returns results whose cluster label distinguishes the two source clusters, confirming that honor_labels: true preserved the originating labels rather than overwriting them with the federation job's own labels.
+# Verify cluster-a federation endpoint carries external_labels
+curl -fsSL "http://localhost:9090/federate?match%5B%5D=%7B__name__%3D~%22up%22%7D" \
+  | grep -E "^up"
+# Expected: lines containing cluster="cluster-a" and region="us-east-1"
+
+# Verify cluster-b federation endpoint
+curl -fsSL "http://localhost:9091/federate?match%5B%5D=%7B__name__%3D~%22up%22%7D" \
+  | grep -E "^up"
+# Expected: lines containing cluster="cluster-b" and region="us-west-2"
+
+# Query the global instance for up â both clusters must appear
+curl -fsSL "http://localhost:9092/api/v1/query?query=up" \
+  | python3 -c "
+import sys, json
+payload = json.load(sys.stdin)
+for r in payload['data']['result']:
+    print(r['metric'].get('cluster','MISSING'), r['metric'].get('instance'), r['value'][1])
+"
+Confirmation: The Python snippet prints at least one row containing cluster-a and at least one row containing cluster-b, with value 1 for each healthy target.
+
+Step 2.2 â Author cross-cluster recording rules and a federation health alert
+Recording rules (pre-computed expressions stored as new time series) reduce query latency and allow the global instance to expose stable metric names that downstream dashboards or alerting systems can rely on regardless of which cluster the data originated from. Write a rules.yml file at /etc/prometheus/federation/rules.yml that satisfies the following requirements:
+
+A group named cluster_aggregates containing three recording rules:
+
+cluster:node_cpu_utilisation:avg1m â per-cluster average CPU utilisation (non-idle fraction) over a 1-minute window, preserving the cluster label
+cluster:node_memory_available_bytes:avg â per-cluster average available memory in bytes, preserving the cluster label
+global:node_cpu_utilisation:avg1m â single scalar representing the mean CPU utilisation across all clusters (no cluster label on the output)
+A group named federation_health containing one alerting rule:
+
+Alert name FederationTargetDown that fires when any target scraped by a job whose name begins with federate- has up == 0 for more than two minutes, with a severity="critical" label and an annotation summary that includes the value of {{ $labels.instance }}.
+After writing the file, reload the federation instance without restarting it (use the /-/reload lifecycle endpoint enabled by --web.enable-lifecycle), then confirm the rules appear in the API response.
+
+sudo tee /etc/prometheus/federation/rules.yml > /dev/null <<'EOF'
+groups:
+  - name: cluster_aggregates
+    interval: 30s
+    rules:
+      - record: "cluster:node_cpu_utilisation:avg1m"
+        expr: |
+          1 - avg by (cluster) (
+            rate(node_cpu_seconds_total{mode="idle"}[1m])
+          )
+
+      - record: "cluster:node_memory_available_bytes:avg"
+        expr: |
+          avg by (cluster) (node_memory_MemAvailable_bytes)
+
+      - record: "global:node_cpu_utilisation:avg1m"
+        expr: |
+          avg(cluster:node_cpu_utilisation:avg1m)
+
+  - name: federation_health
+    rules:
+      - alert: FederationTargetDown
+        expr: up{job=~"federate-.*"} == 0
+        for: 2m
+        labels:
+          severity: "critical"
+        annotations:
+          summary: "Federation target {{ $labels.instance }} is unreachable"
+          description: "Job {{ $labels.job }} has been unable to scrape {{ $labels.instance }} for more than 2 minutes."
+EOF
+
+sudo chown prometheus:prometheus /etc/prometheus/federation/rules.yml
+
+# Validate the rules file before reloading
+promtool check rules /etc/prometheus/federation/rules.yml
+
+# Reload the federation instance via the lifecycle API (no restart required)
+curl -fsSL -X POST http://localhost:9092/-/reload
+# Official lifecycle API docs: https://prometheus.io/docs/prometheus/latest/management_api/
+
+# Wait for the evaluation cycle, then confirm rules are loaded
+sleep 35
+curl -fsSL "http://localhost:9092/api/v1/rules" \
+  | python3 -c "
+import sys, json
+payload = json.load(sys.stdin)
+for g in payload['data']['groups']:
+    print('Group:', g['name'])
+    for r in g['rules']:
+        print('  ', r['type'], r.get('name') or r.get('alert'))
+"
+Confirmation: The Python output lists both groups (cluster_aggregates, federation_health) and all four rules by name. promtool check rules exits with status 0 and prints SUCCESS.
+
+Task 3: Implement a Synthetic Workload Exporter and Validate End-to-End Aggregation
+Step 3.1 â Deploy a custom metrics exporter that simulates two-cluster application traffic
+A production federation topology is only meaningful when cluster-level instances carry application-specific metrics in addition to infrastructure metrics. Implement a Python-based HTTP metrics exporter conforming to the interface contract below. Deploy two instances of it â one representing Cluster A traffic (port 8080) and one representing Cluster B traffic (port 8081) â as systemd services owned by the prometheus user.
+
+Each instance must expose the following metrics in the Prometheus text exposition format at the /metrics path:
+
+app_http_requests_total â counter, labels: method, status_code, endpoint
+app_request_duration_seconds â histogram with buckets [0.05, 0.1, 0.25, 0.5, 1.0, 2.5], labels: endpoint
+app_active_sessions â gauge, no labels
+The exporter must generate realistic variance: request counts must increment on every scrape, latency observations must vary across the histogram buckets, and active sessions must fluctuate within a plausible range (50â500). The exporter must not require any external Python packages beyond prometheus_client.
+
+# Interface contract â implement all methods; do not change signatures
+
+class TrafficSimulator:
+    def __init__(self, seed_rng: int) -> None:
+        """Initialise counters and histogram state. seed_rng controls randomness."""
+        ...
+
+    def tick(self) -> None:
+        """Advance simulation by one step: increment counters, record observations, update gauge."""
+        ...
+
+    def get_registry(self):
+        """Return the prometheus_client CollectorRegistry containing all metrics."""
+        ...
+
+
+def make_app(simulator: TrafficSimulator, tick_interval_seconds: float):
+    """
+    Return a callable WSGI application that:
+    - Calls simulator.tick() on every request to /metrics
+    - Responds with the current registry output in text/plain; version=0.0.4 format
+    - Returns 404 for all other paths
+    """
+    ...
+After deploying both services, add job_name: "app" scrape targets to each cluster-level Prometheus configuration (port 8080 for Cluster A, 8081 for Cluster B), extend the match[] parameter in the federation configuration to include app_http_requests_total and app_request_duration_seconds, and reload all three Prometheus instances.
+
+Confirmation: curl -fsSL http://localhost:8080/metrics | grep app_http_requests_total returns counter lines with non-zero values. The same check on port 8081 returns independent counter values.
+
+Step 3.2 â Validate end-to-end aggregation and cardinality constraints
+With application metrics flowing through the full federation pipeline, verify the following four conditions against the global instance at port 9092. Each condition must be confirmed by a direct API query, not by visual inspection of the web UI.
+
+Condition 1 â Cross-cluster request rate: A PromQL query computing sum by (cluster) (rate(app_http_requests_total[2m])) against the global instance returns two result vectors, one per cluster, each with a non-zero value.
+
+Condition 2 â Latency percentile: A PromQL query computing the 95th-percentile request duration per cluster using histogram_quantile(0.95, sum by (cluster, le) (rate(app_request_duration_seconds_bucket[2m]))) returns two result vectors with values within the histogram's defined bucket range.
+
+Condition 3 â Label preservation: Every result vector returned by the global instance for app_http_requests_total carries a cluster label whose value is either cluster-a or cluster-b, confirming that honor_labels: true and external_labels on the cluster instances are working correctly together.
+
+Condition 4 â Cardinality budget: The total number of active time series on the global instance, reported by prometheus_tsdb_head_series scraped from port 9092, must remain below 2000. If it exceeds this threshold, tighten the match[] selectors in the federation configuration to drop high-cardinality series that are not needed at the global level.
+
+GLOBAL="http://localhost:9092"
+
+echo "=== Condition 1: Cross-cluster request rate ==="
+curl -fsSL "${GLOBAL}/api/v1/query?query=sum+by+(cluster)+(rate(app_http_requests_total%5B2m%5D))" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['data']['result']
+assert len(d) == 2, f'Expected 2 clusters, got {len(d)}'
+for r in d:
+    print(r['metric']['cluster'], float(r['value'][1]))
+print('PASS')
+"
+
+echo ""
+echo "=== Condition 2: 95th-percentile latency per cluster ==="
+QUERY="histogram_quantile(0.95,sum+by+(cluster,le)+(rate(app_request_duration_seconds_bucket%5B2m%5D)))"
+curl -fsSL "${GLOBAL}/api/v1/query?query=${QUERY}" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['data']['result']
+for r in d:
+    v = float(r['value'][1])
+    assert 0 < v <= 2.5, f'p95 {v} outside bucket range'
+    print(r['metric'].get('cluster','?'), f'p95={v:.3f}s')
+print('PASS')
+"
+
+echo ""
+echo "=== Condition 3: cluster label present on all app metric results ==="
+curl -fsSL "${GLOBAL}/api/v1/query?query=app_http_requests_total" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['data']['result']
+missing = [r['metric'] for r in d if 'cluster' not in r['metric']]
+assert not missing, f'Missing cluster label on: {missing}'
+print(f'All {len(d)} series carry cluster label. PASS')
+"
+
+echo ""
+echo "=== Condition 4: global TSDB head series count ==="
+curl -fsSL "${GLOBAL}/api/v1/query?query=prometheus_tsdb_head_series" \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)['data']['result']
+for r in d:
+    count = int(float(r['value'][1]))
+    status = 'PASS' if count < 2000 else 'FAIL â tighten match[] selectors'
+    print(f'Head series: {count}  {status}')
+"
+Confirmation: All four assertion blocks print PASS with no Python AssertionError. If Condition 4 fails, narrow the match[] regex patterns in /etc/prometheus/federation/prometheus.yml and reload the federation instance.
+
+Expected Outcomes
+The global Prometheus instance at port 9092 continuously serves cross-cluster aggregated metrics â including CPU utilisation, memory availability, and application request rates â with cluster labels intact on every time series.
+Recording rules on the global instance produce stable, pre-computed series (cluster:node_cpu_utilisation:avg1m, global:node_cpu_utilisation:avg1m) that are queryable without re-evaluating the full expression on every request.
+Troubleshooting
+If the global instance shows targets in a DOWN state for federate-cluster-a or federate-cluster-b, what does the raw response from the corresponding /federate endpoint tell you about whether the problem is in the upstream cluster instance, the network path, or the match[] selector syntax?
+
+If app_http_requests_total appears on the cluster-level instances but not on the global instance, what specific combination of the honor_labels setting, the external_labels block, and the match[] parameter could each independently cause the metric to be silently dropped or relabelled into an unrecognisable name?
+
+Conclusion
+This lab demonstrated how Prometheus federation creates a two-tier monitoring architecture in which cluster-level instances own their own scrape cycles and the global instance selectively pulls only the metrics required for cross-cluster visibility. The honor_labels directive and external_labels block work together to ensure that label provenance is preserved through the federation boundary without collision. Keeping the match[] selectors narrow is the primary operational lever for controlling cardinality growth on the global instance as the number of federated clusters scales.
