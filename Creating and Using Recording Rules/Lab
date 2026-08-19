@@ -1,0 +1,299 @@
+ Recording Rules in Prometheus â Architecture and Performance Engineering
+Objectives
+Design and deploy a multi-group recording rule hierarchy that eliminates redundant query computation across dependent rule groups
+Measure and quantify the latency difference between raw PromQL expressions and their precomputed recording rule equivalents under sustained load
+Diagnose recording rule evaluation failures using Prometheus internal metrics and the rules API
+Prerequisites
+Comfort with Linux process management, systemd unit files, and file permission models
+Familiarity with time series concepts: labels, cardinality, scrape intervals, and range vectors
+Prior exposure to PromQL syntax including aggregation operators and rate functions
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Install and Verify the Observability Stack
+Step 1.1: Install Prometheus and Node Exporter from Official Releases
+Your goal is a running Prometheus server (port 9090) and Node Exporter (port 9100), both managed as systemd services under a dedicated non-login prometheus system account. Both binaries must be sourced from the official Prometheus GitHub releases page. Verify each service reaches active (running) state before proceeding.
+
+# Create the system account
+sudo useradd --no-create-home --shell /bin/false prometheus
+
+# Create required directories
+sudo mkdir -p /etc/prometheus /var/lib/prometheus /opt/prometheus /opt/node_exporter
+sudo chown prometheus:prometheus /etc/prometheus /var/lib/prometheus /opt/prometheus /opt/node_exporter
+
+# Download Prometheus
+# Official release index: https://github.com/prometheus/prometheus/releases
+curl -fsSL https://github.com/prometheus/prometheus/releases/download/v2.52.0/prometheus-2.52.0.linux-amd64.tar.gz \
+  -o /tmp/prometheus.tar.gz
+# If this URL returns a 404, visit https://github.com/prometheus/prometheus/releases and substitute the current version.
+
+tar -xzf /tmp/prometheus.tar.gz -C /tmp
+sudo cp /tmp/prometheus-2.52.0.linux-amd64/prometheus /opt/prometheus/prometheus
+sudo cp /tmp/prometheus-2.52.0.linux-amd64/promtool  /opt/prometheus/promtool
+sudo cp -r /tmp/prometheus-2.52.0.linux-amd64/consoles        /opt/prometheus/consoles
+sudo cp -r /tmp/prometheus-2.52.0.linux-amd64/console_libraries /opt/prometheus/console_libraries
+sudo chown -R prometheus:prometheus /opt/prometheus
+
+# Download Node Exporter
+# Official release index: https://github.com/prometheus/node_exporter/releases
+curl -fsSL https://github.com/prometheus/node_exporter/releases/download/v1.8.1/node_exporter-1.8.1.linux-amd64.tar.gz \
+  -o /tmp/node_exporter.tar.gz
+# If this URL returns a 404, visit https://github.com/prometheus/node_exporter/releases and substitute the current version.
+
+tar -xzf /tmp/node_exporter.tar.gz -C /tmp
+sudo cp /tmp/node_exporter-1.8.1.linux-amd64/node_exporter /opt/node_exporter/node_exporter
+sudo chown prometheus:prometheus /opt/node_exporter/node_exporter
+Troubleshoot this step:
+
+You may see curl: (22) The requested URL returned error: 404 if the version string in the URL does not match a published release.
+Run curl -fsSL https://api.github.com/repos/prometheus/prometheus/releases/latest | grep tag_name to discover the current version, then rebuild the URL.
+Official guide: https://prometheus.io/docs/prometheus/latest/installation/
+# Write Node Exporter systemd unit
+sudo tee /etc/systemd/system/node_exporter.service <<'EOF'
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/opt/node_exporter/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Write Prometheus systemd unit
+sudo tee /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/opt/prometheus/prometheus \
+    --config.file=/etc/prometheus/prometheus.yml \
+    --storage.tsdb.path=/var/lib/prometheus \
+    --web.console.templates=/opt/prometheus/consoles \
+    --web.console.libraries=/opt/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now node_exporter prometheus
+Troubleshoot this step:
+
+You may see Failed to start prometheus.service: Unit not found or code=exited, status=1/FAILURE in journalctl -u prometheus -n 30.
+Run sudo -u prometheus /opt/prometheus/prometheus --config.file=/etc/prometheus/prometheus.yml directly to surface the exact startup error before the config file exists.
+Official guide: https://prometheus.io/docs/prometheus/latest/getting_started/
+Step 1.2: Write a Minimal Prometheus Configuration and Verify Scraping
+Write /etc/prometheus/prometheus.yml so that Prometheus scrapes itself and Node Exporter, and references a rule_files entry pointing to /etc/prometheus/recording_rules.yml (which you will create in Task 2). The evaluation_interval must be set to 15s. Confirm that both targets appear as UP in the Prometheus targets UI at http://<instance-ip>:9090/targets before moving on.
+
+sudo tee /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "/etc/prometheus/recording_rules.yml"
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: node
+    static_configs:
+      - targets: ["localhost:9100"]
+EOF
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+
+# Validate the configuration before reloading
+/opt/prometheus/promtool check config /etc/prometheus/prometheus.yml
+
+# Reload Prometheus (the --web.enable-lifecycle flag makes this endpoint available)
+curl -fsSL -X POST http://localhost:9090/-/reload
+Troubleshoot this step:
+
+You may see FAILED: parsing YAML file /etc/prometheus/prometheus.yml: yaml: line N: ... from promtool check config.
+Run cat -A /etc/prometheus/prometheus.yml to reveal hidden characters or tab indentation, which YAML forbids; replace all tabs with two spaces.
+Official guide: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+Confirmation: curl -fsSL http://localhost:9090/api/v1/targets | python3 -c "import sys,json; [print(t['labels']['job'], t['health']) for t in json.load(sys.stdin)['data']['activeTargets']]" must print prometheus up and node up.
+
+Task 2: Design and Deploy a Multi-Group Recording Rule Hierarchy
+Background
+A recording rule instructs Prometheus to evaluate a PromQL expression on a fixed interval and store the result as a new time series with a chosen metric name. The naming convention level:metric:operation (for example node:cpu_utilization:rate5m) is the Prometheus community standard and must be followed throughout this task. Rules within a group are evaluated sequentially, which means a rule defined later in the same group can reference a metric produced by an earlier rule in the same evaluation cycle â this is the foundation of a rule hierarchy.
+
+Step 2.1: Implement the Base Metric Layer
+Design a recording rule group named node_base with an evaluation interval of 15s. This group must produce the four base metrics listed in the interface contract below. Each rule expression must be correct PromQL that produces a scalar-per-instance result. After writing the file, validate it with promtool check rules and reload Prometheus. Confirm each metric appears in the TSDB by querying the Prometheus HTTP API.
+
+# Interface contract â implement the expr field for each rule.
+# File: /etc/prometheus/recording_rules.yml
+
+groups:
+  - name: node_base
+    interval: 15s
+    rules:
+      - record: node:cpu_utilization:rate5m
+        expr: <STUDENT_IMPLEMENTS>
+        # Must return: percentage of CPU time NOT spent idle, averaged across all cores, per instance
+        # Permitted source metrics: node_cpu_seconds_total
+
+      - record: node:memory_utilization:ratio
+        expr: <STUDENT_IMPLEMENTS>
+        # Must return: fraction of total memory that is in use (0.0 to 1.0), per instance
+        # Permitted source metrics: node_memory_MemTotal_bytes, node_memory_MemAvailable_bytes
+
+      - record: node:disk_utilization:ratio
+        expr: <STUDENT_IMPLEMENTS>
+        # Must return: fraction of root filesystem capacity that is used (0.0 to 1.0), per instance
+        # Permitted source metrics: node_filesystem_size_bytes, node_filesystem_avail_bytes
+        # Constraint: filter to mountpoint="/" only
+
+      - record: node:network_throughput:rate5m_bytes
+        expr: <STUDENT_IMPLEMENTS>
+        # Must return: combined inbound + outbound bytes per second, per network device, per instance
+        # Permitted source metrics: node_network_receive_bytes_total, node_network_transmit_bytes_total
+        # Constraint: exclude the loopback device
+Confirmation: curl -fsSL 'http://localhost:9090/api/v1/query?query=node:cpu_utilization:rate5m' must return a non-empty result array with a numeric value.
+
+Step 2.2: Implement the Derived Composite Layer
+Add a second group named node_composite with an evaluation interval of 30s. This group must reference only the base metrics produced by node_base â it must not reference raw node_* metrics directly. This constraint enforces the hierarchy: the composite layer depends on the base layer. Implement the two composite rules below, then verify that node:system_pressure:score returns a value between 0 and 100.
+
+# Append to /etc/prometheus/recording_rules.yml under the same top-level `groups:` key.
+
+  - name: node_composite
+    interval: 30s
+    rules:
+      - record: node:system_pressure:score
+        expr: <STUDENT_IMPLEMENTS>
+        # Must return: a weighted composite score (0â100) per instance
+        # Weights: cpu_utilization 40%, memory_utilization*100 35%, disk_utilization*100 25%
+        # All inputs must come from node_base recording rule metrics only
+
+      - record: node:network_throughput:rate5m_mbps
+        expr: <STUDENT_IMPLEMENTS>
+        # Must return: node:network_throughput:rate5m_bytes converted to megabits per second
+        # Input must come from node_base recording rule metrics only
+Confirmation: Run curl -fsSL 'http://localhost:9090/api/v1/rules' | python3 -c "import sys,json; d=json.load(sys.stdin); [print(g['name'], len(g['rules']), 'rules') for g in d['data']['groups']]" and confirm both node_base and node_composite appear with the correct rule counts.
+
+Task 3: Measure Performance and Validate Rule Health
+Step 3.1: Quantify Query Latency â Raw Expression vs. Recording Rule
+Write a shell script at /opt/prometheus/bench.sh that satisfies the interface below. The script must execute each query five times, compute the arithmetic mean response time in milliseconds, and print a formatted comparison table to stdout. Run the script and capture its output to /tmp/bench_results.txt. The expected outcome is that recording rule queries complete faster than their raw equivalents because Prometheus reads a pre-stored time series rather than scanning and computing over raw samples.
+
+# Interface contract for /opt/prometheus/bench.sh
+# The script accepts no arguments.
+# It must define and call the following function:
+
+bench_query() {
+  local description="$1"   # human-readable label
+  local query="$2"          # URL-encoded PromQL expression
+  local iterations="$3"     # number of repetitions (caller passes 5)
+  # Returns: prints one line: "<description>: <mean_ms> ms"
+}
+
+# The script must call bench_query for each of the following pairs:
+#   Pair 1 â CPU utilization
+#     Raw:  100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+#     Rule: node:cpu_utilization:rate5m
+#   Pair 2 â Memory utilization
+#     Raw:  (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100
+#     Rule: node:memory_utilization:ratio * 100
+#   Pair 3 â System pressure composite
+#     Raw:  reconstruct the full weighted expression inline
+#     Rule: node:system_pressure:score
+#
+# After all bench_query calls, print a summary line stating which approach
+# was faster for each pair and by what percentage.
+# Skeleton â students implement the body of bench_query and the summary logic.
+sudo tee /opt/prometheus/bench.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROMETHEUS_URL="http://localhost:9090"
+
+bench_query() {
+  local description="$1"
+  local query="$2"
+  local iterations="$3"
+  # STUDENT IMPLEMENTS: loop $iterations times, time each curl call to
+  # ${PROMETHEUS_URL}/api/v1/query?query=${query}, accumulate elapsed time,
+  # compute mean in milliseconds, print result line.
+}
+
+# STUDENT IMPLEMENTS: call bench_query for each pair, then print summary.
+EOF
+
+sudo chmod +x /opt/prometheus/bench.sh
+/opt/prometheus/bench.sh | tee /tmp/bench_results.txt
+Confirmation: /tmp/bench_results.txt must contain six labelled timing lines and three summary comparison lines.
+
+Step 3.2: Validate Rule Health Using Prometheus Internal Metrics
+Prometheus exposes its own rule evaluation health as time series. Your goal is to write a diagnostic script at /opt/prometheus/rule_health.sh that queries three internal Prometheus metrics and prints a structured health report. The script must exit with code 1 if any rule group has recorded evaluation failures, and exit with code 0 if all groups are healthy.
+
+# Interface contract for /opt/prometheus/rule_health.sh
+# The script accepts no arguments.
+# It must query and report on the following internal Prometheus metrics:
+
+rule_health_check() {
+  local metric_name="$1"
+  # prometheus_rule_evaluation_duration_seconds â report p99 per rule group
+  # prometheus_rule_evaluation_failures_total   â report total failures per rule group
+  # prometheus_rule_group_last_duration_seconds â report last full group evaluation time
+  # Returns: prints formatted lines; sets a global FAILURES_FOUND flag if failures > 0
+}
+
+# Exit behaviour:
+#   exit 0 if FAILURES_FOUND is unset or zero
+#   exit 1 if FAILURES_FOUND is non-zero, printing "RULE HEALTH DEGRADED" to stderr
+sudo tee /opt/prometheus/rule_health.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROMETHEUS_URL="http://localhost:9090"
+FAILURES_FOUND=0
+
+rule_health_check() {
+  local metric_name="$1"
+  # STUDENT IMPLEMENTS: curl the query API, parse JSON with python3,
+  # print one line per result series, set FAILURES_FOUND=1 if
+  # metric_name is prometheus_rule_evaluation_failures_total and value > 0
+}
+
+rule_health_check "prometheus_rule_evaluation_duration_seconds"
+rule_health_check "prometheus_rule_evaluation_failures_total"
+rule_health_check "prometheus_rule_group_last_duration_seconds"
+
+if [ "$FAILURES_FOUND" -ne 0 ]; then
+  echo "RULE HEALTH DEGRADED" >&2
+  exit 1
+fi
+
+echo "All rule groups healthy."
+exit 0
+EOF
+
+sudo chmod +x /opt/prometheus/rule_health.sh
+/opt/prometheus/rule_health.sh
+Confirmation: The script exits with code 0 and prints one line per rule group for each of the three internal metrics. Verify the exit code with echo "Exit code: $?" immediately after running the script.
+
+Expected Outcomes
+Recording rule queries for CPU, memory, and composite system pressure return results measurably faster than their raw PromQL equivalents, with the performance gap widening as query complexity increases.
+The rule health script exits with code 0, confirming that both node_base and node_composite groups are evaluating without failures and within their configured intervals.
+Troubleshooting
+If node:system_pressure:score returns no data while node:cpu_utilization:rate5m does return data, what does this tell you about the evaluation order dependency between node_base and node_composite, and how would you use prometheus_rule_group_last_duration_seconds to determine whether the composite group is evaluating before the base group has produced its first sample?
+
+If promtool check rules reports no syntax errors but the Prometheus rules API shows a rule group with lastError set to a non-empty string, what is the difference between a parse-time error and a runtime evaluation error, and which Prometheus internal metric would you query to determine how frequently that runtime error is occurring?
+
+Conclusion
+Recording rules shift computational cost from query time to evaluation time, making them essential for any metric that is queried repeatedly by dashboards, alerts, or downstream rule groups. The hierarchical pattern â where composite rules consume base recording rule metrics rather than raw instrumentation â reduces both cardinality pressure and expression complexity at each layer. Mastering this pattern is a prerequisite for operating Prometheus at production scale, where unoptimized queries against high-cardinality raw metrics are a primary source of latency and memory pressure.
