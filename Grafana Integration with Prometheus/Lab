@@ -1,0 +1,93 @@
+Monitoring Kubernetes with Prometheus and Grafana
+Objectives
+Deploy a production-grade Prometheus and Grafana monitoring stack on a single-node Kubernetes cluster using Helm
+Configure Prometheus to scrape Kubernetes cluster, node, and pod-level metrics through ServiceMonitors and custom scrape rules
+Build and validate Grafana dashboards that surface real-time resource utilization and trigger alerting rules under synthetic load
+Prerequisites
+Comfort with Linux command-line operations including file editing, process management, and reading command output
+Conceptual understanding of Kubernetes primitives: pods, deployments, services, and namespaces
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Install and Verify the Full Toolchain
+Requirement 1
+Design and execute an installation sequence that produces a functioning single-node Kubernetes cluster, a working Helm package manager, and a verified kubectl connection â all on a bare Ubuntu instance. Your sequence must install Docker (container runtime), k3s (a lightweight, CNCF-conformant Kubernetes distribution that runs as a single binary), kubectl (the Kubernetes CLI), and Helm (a Kubernetes package manager that installs pre-packaged application bundles called charts). Every tool must be sourced from its official distribution channel.
+
+Acceptance Criterion 1: Running kubectl get nodes returns one node with status Ready, and helm version prints a version string without error.
+
+Acceptance Criterion 2: Running kubectl get pods -A shows only system-level pods (in namespaces kube-system or kube-public) and every listed pod has status Running or Completed â no pod is in CrashLoopBackOff or Pending.
+
+Troubleshoot this step:
+
+You may see: WARN[0000] Unable to read /etc/rancher/k3s/k3s.yaml, please start server with --write-kubeconfig-mode to modify kube config permissions when running kubectl.
+Run: sudo chmod 644 /etc/rancher/k3s/k3s.yaml and confirm kubectl get nodes succeeds without sudo.
+Official k3s documentation: https://docs.k3s.io/quick-start
+Requirement 2
+Add the prometheus-community and grafana Helm chart repositories to your local Helm installation, then update the local repository cache. Confirm that both repositories are listed and reachable before proceeding.
+
+Acceptance Criterion 1: Running helm repo list shows entries named prometheus-community and grafana with their canonical URLs.
+
+Acceptance Criterion 2: Running helm search repo kube-prometheus-stack returns at least one chart result with a version number, confirming the cache is populated.
+
+Troubleshoot this step:
+
+You may see: Error: looks like "https://prometheus-community.github.io/helm-charts" is not a valid chart repository or cannot be reached.
+Run: curl -fsSL https://prometheus-community.github.io/helm-charts/index.yaml | head -5 â if this fails, your instance has no outbound HTTPS access; verify security group egress rules in the AWS console.
+Official Helm repository documentation: https://helm.sh/docs/helm/helm_repo_add/
+Task 2: Deploy the Prometheus and Grafana Monitoring Stack
+Requirement 1
+Design and deploy the kube-prometheus-stack Helm chart (a bundled release that installs Prometheus, Grafana, Alertmanager, node-exporter, and kube-state-metrics in a single operation) into a dedicated Kubernetes namespace named monitoring. Your deployment must satisfy all of the following constraints without using any default values for the listed parameters:
+
+Prometheus must retain metrics data for at least 15 days (configure the retention field).
+Grafana must be reachable from outside the cluster on a fixed NodePort â choose any port in the range 30000-32767 and document your choice.
+Node-exporter (a daemon that exposes host-level hardware and OS metrics) and kube-state-metrics (a service that exposes Kubernetes object state as metrics) must both be explicitly enabled.
+Alertmanager must be explicitly enabled.
+All configuration must be expressed in a Helm values file that you author; no inline --set flags are permitted for these parameters.
+You must wait for all pods in the monitoring namespace to reach Running status before proceeding.
+
+Acceptance Criterion 1: Running kubectl get pods -n monitoring shows pods whose names contain prometheus, grafana, alertmanager, node-exporter, and kube-state-metrics, and every pod reports status Running with all containers ready (the READY column shows N/N).
+
+Acceptance Criterion 2: Running curl -fsSL http://localhost:<your-chosen-nodeport>/api/health (substituting your chosen NodePort) returns a JSON response containing the key "database" with value "ok", confirming Grafana is live and its internal database is initialized.
+
+Troubleshoot this step:
+
+You may see pods stuck in Pending with the event: 0/1 nodes are available: 1 Insufficient memory.
+Run: kubectl describe node | grep -A5 "Allocated resources" to inspect actual resource consumption; reduce replica counts or remove resource requests in your values file if the node is over-committed.
+Official kube-prometheus-stack values reference: https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack
+Requirement 2
+Design and apply a PrometheusRule custom resource (a Kubernetes object that tells Prometheus which alert conditions to evaluate) containing at minimum three alerting rules that cover the following distinct failure categories: pod crash-looping, node memory pressure above 80 percent, and any pod remaining in a non-Running phase for more than five minutes. Each rule must include a severity label and human-readable summary and description annotations. Then deploy a two-replica workload using the progrium/stress container image that consumes CPU and memory resources sufficient to produce visible metric spikes â confirm the spikes appear in Prometheus before moving to Task 3.
+
+Acceptance Criterion 1: Running kubectl get prometheusrules -n monitoring lists your rule resource, and querying http://localhost:9090/api/v1/rules (via a port-forward to the Prometheus service on port 9090) returns a JSON body where your three alert names appear under a groups entry with "type": "alerting".
+
+Acceptance Criterion 2: Querying http://localhost:9090/api/v1/query?query=rate(container_cpu_usage_seconds_total[2m]) while the stress workload is running returns a non-empty result array containing entries whose metric.pod label matches your stress pod names, confirming Prometheus is actively scraping container metrics.
+
+Troubleshoot this step:
+
+You may see your PrometheusRule listed but rules absent from the /api/v1/rules response, with no error shown.
+Run: kubectl get prometheusrule <your-rule-name> -n monitoring -o jsonpath='{.metadata.labels}' and compare the labels against the ruleSelector field in your Prometheus custom resource (kubectl get prometheus -n monitoring -o yaml | grep -A5 ruleSelector) â the labels must match exactly.
+Prometheus Operator rule selection documentation: https://prometheus-operator.dev/docs/developer/alerting/
+Task 3: Build and Validate Grafana Dashboards
+Requirement 1
+Using only the Grafana HTTP API (no manual browser interaction is permitted for dashboard creation), design and import two dashboards into Grafana. The first dashboard must display cluster-wide CPU utilization percentage, cluster-wide memory utilization percentage, and a per-namespace pod count â all as live panels sourcing data from the Prometheus datasource. The second dashboard must display per-pod CPU usage in cores and per-pod memory working set in bytes as time-series panels. All panels must use a 30-second auto-refresh interval and a default time window of the last one hour. You must verify that the Prometheus datasource is configured and reachable inside Grafana before importing dashboards; if the default datasource installed by the Helm chart is not named Prometheus, rename or reconfigure it via the API so your dashboard JSON references a datasource that resolves correctly.
+
+Acceptance Criterion 1: Querying http://localhost:<your-nodeport>/api/dashboards/home with valid Grafana credentials returns HTTP 200, and querying http://localhost:<your-nodeport>/api/search?type=dash-db returns a JSON array containing exactly two dashboard entries whose titles match the names you chose.
+
+Acceptance Criterion 2: For each dashboard, querying the Grafana panel data API (/api/ds/query) with the PromQL expression used in your CPU panel returns a non-empty frames array with at least one data point whose timestamp falls within the last five minutes, confirming the datasource connection is live and panels are not showing "No data".
+
+Troubleshoot this step:
+
+You may see panel errors reading datasource not found or template variable not found after import.
+Run: curl -fsSL -u admin:<password> http://localhost:<nodeport>/api/datasources and confirm the name and uid fields in the response match exactly what your dashboard JSON references in each panel's datasource object â correct the JSON and re-import if they differ.
+Grafana dashboard API documentation: https://grafana.com/docs/grafana/latest/developers/http_api/dashboard/
+Requirement 2
+Design a validation procedure that generates a sustained, measurable load event and confirms end-to-end observability: from metric generation, through Prometheus scraping, to Grafana visualization, and finally to alert state change. Deploy a workload that drives node CPU above 60 percent for at least three minutes. During that window, confirm that Prometheus transitions at least one of your custom alert rules to pending or firing state. Then confirm that the CPU panel in your first Grafana dashboard reflects the elevated utilization with data points above 60 percent. Finally, clean up all stress workloads and confirm that CPU metrics return below 20 percent within five minutes of deletion.
+
+Acceptance Criterion 1: While the load workload is running, querying http://localhost:9090/api/v1/alerts returns a JSON body where at least one alert object has "state": "pending" or "state": "firing" and its labels.alertname matches one of the three rules you defined in Task 2.
+
+Acceptance Criterion 2: After deleting all stress workloads and waiting five minutes, querying http://localhost:9090/api/v1/query?query=100-(avg(irate(node_cpu_seconds_total{mode="idle"}[2m]))*100) returns a scalar result below 20, and querying /api/v1/alerts returns either an empty alerts array or all alerts in "state": "inactive".
+
+Expected Outcomes
+A fully operational Kubernetes monitoring stack where Prometheus continuously scrapes cluster, node, and pod metrics and Grafana displays them in structured dashboards accessible via NodePort without any manual browser configuration.
+Custom alerting rules that demonstrably transition through Prometheus alert states in response to real workload conditions, confirming the full observability pipeline from metric collection to alert evaluation is functioning correctly.
+Conclusion
+This lab required you to construct a complete Kubernetes observability stack from a bare operating system, making every architectural decision â from Helm values to PromQL expressions to Grafana API calls â without guided steps. The skills exercised here â declarative configuration, metric-driven alerting, and API-first dashboard management â are the operational foundation for running Kubernetes workloads reliably in production. Extend this foundation by exploring recording rules to pre-compute expensive queries, and by integrating Alertmanager with a real notification channel such as Slack or PagerDuty.
