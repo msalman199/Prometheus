@@ -1,0 +1,330 @@
+Metric Best Practices
+Objectives
+Design and instrument a Python web service with production-grade Prometheus metrics that enforce naming conventions, unit suffixes, and bounded label cardinality
+Implement Prometheus recording and alerting rules that pre-aggregate high-cost queries and fire on SLO violations
+Diagnose and remediate a deliberately broken metric implementation by comparing time-series cardinality, query performance, and alert correctness between the two versions
+Prerequisites
+Comfort with the Linux command line, including file permissions, process management, and systemd service control
+Familiarity with HTTP request/response cycles and the concept of time-series data (a sequence of numeric values indexed by timestamp)
+Prior exposure to at least one monitoring or observability concept such as counters, gauges, or histograms
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Environment Setup
+Step 1.1: Install System Dependencies, Prometheus, Node Exporter, and Grafana
+Your environment must satisfy the following constraints before any application work begins:
+
+Prometheus (v2.45.0 or later) must run as a dedicated non-login system user with its data directory owned exclusively by that user; this is a security constraint that prevents the scrape process from writing outside its designated path
+Node Exporter must run as the same system user and expose host-level metrics on port 9100
+Grafana OSS must be installed from the official Grafana APT repository and reachable on port 3000
+Install system packages first:
+
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt-get install -y curl wget git vim jq python3 python3-pip net-tools
+Install Prometheus:
+
+# Official release index: https://github.com/prometheus/prometheus/releases
+cd /tmp
+wget -fsSL https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.linux-amd64.tar.gz
+tar xzf prometheus-2.45.0.linux-amd64.tar.gz
+
+sudo useradd --no-create-home --shell /bin/false prometheus
+sudo mkdir -p /etc/prometheus /var/lib/prometheus
+sudo cp prometheus-2.45.0.linux-amd64/prometheus /usr/local/bin/
+sudo cp prometheus-2.45.0.linux-amd64/promtool /usr/local/bin/
+sudo cp -r prometheus-2.45.0.linux-amd64/consoles /etc/prometheus/
+sudo cp -r prometheus-2.45.0.linux-amd64/console_libraries /etc/prometheus/
+sudo chown -R prometheus:prometheus /etc/prometheus /var/lib/prometheus
+sudo chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+Troubleshoot this step:
+
+You may see tar: Error is not recoverable if the download was silently truncated â this means the GitHub URL returned an HTML redirect page instead of the binary.
+Run file /tmp/prometheus-2.45.0.linux-amd64.tar.gz â if it reports HTML document rather than gzip compressed data, delete the file and re-download using the direct asset URL from the releases page.
+Official guide: https://prometheus.io/docs/prometheus/latest/installation/
+Install Node Exporter:
+
+# Official release index: https://github.com/prometheus/node_exporter/releases
+cd /tmp
+wget -fsSL https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+tar xzf node_exporter-1.6.1.linux-amd64.tar.gz
+sudo cp node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+sudo chown prometheus:prometheus /usr/local/bin/node_exporter
+Install Grafana:
+
+# Official installation guide: https://grafana.com/docs/grafana/latest/setup-grafana/installation/debian/
+sudo apt-get install -y apt-transport-https software-properties-common
+
+sudo mkdir -p /etc/apt/keyrings
+wget -fsSL https://apt.grafana.com/gpg.key | gpg --dearmor | sudo tee /etc/apt/keyrings/grafana.gpg > /dev/null
+
+sudo tee /etc/apt/sources.list.d/grafana.list <<'EOF'
+deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main
+EOF
+
+sudo apt-get update
+sudo apt-get install -y grafana
+Troubleshoot this step:
+
+You may see E: Malformed entry 1 in list file /etc/apt/sources.list.d/grafana.list if the tee heredoc wrote a backslash or extra whitespace into the file.
+Inspect the file with cat /etc/apt/sources.list.d/grafana.list â it must be a single unbroken line; delete and recreate it using the heredoc form above if it is not.
+Official guide: https://grafana.com/docs/grafana/latest/setup-grafana/installation/debian/
+Step 1.2: Create Systemd Services and Start the Stack
+Create the Prometheus systemd unit:
+
+sudo tee /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus Monitoring System
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file=/etc/prometheus/prometheus.yml \
+    --storage.tsdb.path=/var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Create the Node Exporter systemd unit:
+
+sudo tee /etc/systemd/system/node_exporter.service <<'EOF'
+[Unit]
+Description=Prometheus Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Write a minimal Prometheus configuration so the service starts cleanly:
+
+sudo tee /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: node_exporter
+    static_configs:
+      - targets: ['localhost:9100']
+EOF
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Start all services:
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now prometheus node_exporter grafana-server
+Confirm the stack is healthy:
+
+sudo systemctl is-active prometheus node_exporter grafana-server
+curl -fsSL http://localhost:9090/-/healthy
+curl -fsSL http://localhost:9100/metrics | head -5
+curl -fsSL http://localhost:3000/api/health
+Troubleshoot this step:
+
+You may see Failed to connect to localhost port 9090: Connection refused immediately after systemctl start because Prometheus needs a few seconds to bind its port.
+Wait 10 seconds and retry; if the service shows failed in systemctl status prometheus, run journalctl -u prometheus -n 30 to read the startup error â the most common cause is a malformed prometheus.yml which you can validate with promtool check config /etc/prometheus/prometheus.yml.
+Official guide: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+Confirmation: All three is-active outputs read active, and each curl returns a 200-class response with non-empty body.
+
+Task 2: Instrument Two Application Versions and Expose Their Metrics
+Cardinality (the total number of unique label-value combinations tracked for a single metric) is the primary driver of Prometheus memory consumption. This task requires you to build two Flask applications â one that violates cardinality and naming rules, and one that enforces them â so the difference is measurable.
+
+Step 2.1: Build the Non-Compliant Application on Port 5000
+Install Python dependencies:
+
+pip3 install flask prometheus_client psutil
+Your non-compliant application must satisfy these requirements so that its anti-patterns are observable in Prometheus:
+
+Expose at least one Counter whose name has no namespace prefix and no unit suffix (for example, a bare name like requests)
+Expose one Counter that includes user_id, session_id, and ip_address as label dimensions; the traffic generator in Step 2.3 will supply random values for each, producing unbounded cardinality
+Expose at least one Gauge whose name omits a unit suffix, making the stored value ambiguous (for example, memory_usage with no _bytes or _ratio suffix)
+Serve the Prometheus text exposition format at /metrics and application traffic at / and /api/users/<user_id>
+Implement the application against this interface contract:
+
+class NonCompliantApp:
+    def create_metrics(self) -> None:
+        """
+        Instantiate all prometheus_client metric objects.
+        Must create: bare-named Counter, high-cardinality Counter with
+        labels ['method','endpoint','status','user_id','session_id','ip_address'],
+        unit-free Gauge for memory, unit-free Gauge for disk.
+        """
+        ...
+
+    def home(self) -> tuple:
+        """
+        Increment all counters using a randomly generated user_id,
+        session_id, and ip_address on every request.
+        Return a JSON response and HTTP 200.
+        """
+        ...
+
+    def get_user(self, user_id: str) -> tuple:
+        """
+        Increment the high-cardinality counter using the raw path segment
+        as the endpoint label value (e.g. '/api/users/4821').
+        Return a JSON response and HTTP 200.
+        """
+        ...
+Step 2.2: Build the Compliant Application on Port 5001
+Your compliant application must satisfy these architectural constraints:
+
+All metric names must follow the pattern <namespace>_<subsystem>_<name>_<unit> where unit is one of the Prometheus-recommended suffixes: _total for counters, _seconds for durations, _bytes for sizes, _ratio for dimensionless fractions between 0 and 1
+Label sets must be closed and bounded: the only permitted label dimensions on the HTTP request counter are method, handler, and status_code; handler must be a fixed route name (for example home, get_user), never a raw URL path containing variable segments
+The request duration Histogram must declare explicit bucket boundaries appropriate for a web service (sub-second to multi-second range); do not rely on the default buckets
+System resource metrics must use psutil to read real values and must carry correct unit suffixes
+Implement the application against this interface contract:
+
+class CompliantApp:
+    def create_metrics(self) -> None:
+        """
+        Instantiate: Info metric for build metadata, Counter with labels
+        ['method','handler','status_code'], Histogram with labels
+        ['method','handler'] and explicit buckets, Gauge for active_users,
+        Gauge for memory_usage_ratio (0-1), Gauge for disk_usage_bytes,
+        Counter with label ['error_type'].
+        """
+        ...
+
+    def record_request(
+        self,
+        handler: str,
+        method: str,
+        status_code: int,
+        duration_seconds: float
+    ) -> None:
+        """
+        Increment the request counter and observe the duration histogram.
+        Called from every route handler before returning a response.
+        """
+        ...
+
+    def home(self) -> tuple:
+        """
+        Measure wall-clock duration, update system gauges using psutil,
+        call record_request, return JSON and HTTP 200.
+        """
+        ...
+
+    def get_user(self, user_id: int) -> tuple:
+        """
+        Reject user_id outside [1, 9999] with HTTP 400.
+        Measure duration, call record_request with appropriate status_code.
+        """
+        ...
+
+    def health(self) -> tuple:
+        """
+        Return JSON with status and uptime_seconds.
+        Call record_request with handler='health'.
+        """
+        ...
+Step 2.3: Register Both Applications in Prometheus and Generate Traffic
+Update /etc/prometheus/prometheus.yml to add both application scrape targets, then reload Prometheus without restarting it (use the /-/reload lifecycle endpoint).
+
+Create a traffic generator script that runs for at least 60 seconds and sends concurrent requests to both ports. The script must:
+
+Send requests to /?user_id=<random_integer> on port 5000 with at least 200 distinct user ID values to force cardinality growth
+Send requests to /api/users/<id> on both ports with id values drawn from the range 1-500
+Send requests to /api/health on port 5001 only
+Print a progress line every 20 requests so you can confirm it is running
+After the traffic generator completes, run the following cardinality audit and capture its output â you will need the numbers in Task 3:
+
+echo "=== Non-compliant app: http_requests_total series count ==="
+curl -fsSL 'http://localhost:9090/api/v1/query?query=count({job="bad-app"})' | jq '.data.result[0].value[1]'
+
+echo "=== Compliant app: all series count ==="
+curl -fsSL 'http://localhost:9090/api/v1/query?query=count({job="good-app"})' | jq '.data.result[0].value[1]'
+
+echo "=== Compliant app: request counter label combinations ==="
+curl -fsSL 'http://localhost:9090/api/v1/query?query=count(myapp_http_requests_total)' | jq '.data.result[0].value[1]'
+Confirmation: The non-compliant app series count must be at least 5x larger than the compliant app series count, demonstrating the cardinality cost of unbounded labels.
+
+Task 3: Implement Recording Rules, Alerting Rules, and a Grafana Dashboard
+Recording rules (PromQL expressions that Prometheus evaluates on a schedule and stores as new time series) reduce query latency for expensive aggregations. Alerting rules fire notifications when a PromQL expression is true for a sustained duration.
+
+Step 3.1: Write and Validate Recording and Alerting Rules
+Create /etc/prometheus/rules/ and write two rule files. Both files must pass promtool check rules before you reload Prometheus.
+
+Your recording rules file must pre-compute:
+
+Five-minute request rate per handler for the compliant app, stored as myapp:http_request_rate5m_by_handler
+Five-minute error ratio (5xx responses divided by all responses) for the compliant app, stored as myapp:http_error_ratio5m
+Disk usage converted from bytes to gibibytes, stored as myapp:disk_usage_gib
+Your alerting rules file must define these three alerts, all scoped to job="good-app":
+
+Alert name	Condition	Pending duration	Severity label
+HighErrorRate	myapp:http_error_ratio5m > 0.05	2 minutes	warning
+HighMemoryUsage	myapp_memory_usage_ratio > 0.85	5 minutes	critical
+ApplicationDown	up == 0	1 minute	critical
+Each alert annotation must include a summary string and a description string that embeds the current metric value using the {{ $value | humanizePercentage }} or {{ $value }} template function as appropriate.
+
+Validate and reload:
+
+promtool check config /etc/prometheus/prometheus.yml
+promtool check rules /etc/prometheus/rules/recording_rules.yml
+promtool check rules /etc/prometheus/rules/alerting_rules.yml
+curl -fsSL -X POST http://localhost:9090/-/reload
+Confirmation: curl -fsSL http://localhost:9090/api/v1/rules | jq '[.data.groups[].rules[].name]' lists all five rule names you defined.
+
+Step 3.2: Build a Grafana Dashboard That Proves the Cardinality Difference
+Register Prometheus as a Grafana data source via the HTTP API (default credentials are admin/admin; Grafana will prompt for a password change on first browser login):
+
+# Official API reference: https://grafana.com/docs/grafana/latest/developers/http_api/data_source/
+curl -fsSL -X POST http://admin:admin@localhost:3000/api/datasources \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Prometheus",
+    "type": "prometheus",
+    "url": "http://localhost:9090",
+    "access": "proxy",
+    "isDefault": true
+  }'
+Troubleshoot this step:
+
+You may see {"message":"Data source with the same name already exists"} if Grafana auto-provisioned a default Prometheus source on startup.
+List existing sources with curl -fsSL http://admin:admin@localhost:3000/api/datasources | jq '.[].name' and use a PUT to /api/datasources/<id> to update the URL instead of creating a duplicate.
+Official guide: https://grafana.com/docs/grafana/latest/developers/http_api/data_source/
+Create a dashboard JSON file at ~/metric-lab/dashboards/comparison.json and import it via the API. The dashboard must contain exactly four panels arranged in a 2x2 grid:
+
+Panel	Type	PromQL	Purpose
+Request rate (compliant)	Time series	sum(myapp:http_request_rate5m_by_handler) by (handler)	Shows bounded label set
+Error ratio (compliant)	Stat	myapp:http_error_ratio5m	Shows pre-computed recording rule
+Series count comparison	Bar gauge	count({job="bad-app"}) and count({job="good-app"}) as two targets	Visualises cardinality gap
+P95 request latency	Time series	histogram_quantile(0.95, sum(rate(myapp_http_request_duration_seconds_bucket[5m])) by (le, handler))	Validates histogram bucket design
+Import the dashboard:
+
+# Official API reference: https://grafana.com/docs/grafana/latest/developers/http_api/dashboard/
+curl -fsSL -X POST http://admin:admin@localhost:3000/api/dashboards/import \
+  -H 'Content-Type: application/json' \
+  -d "{\"dashboard\": $(cat ~/metric-lab/dashboards/comparison.json), \"overwrite\": true, \"folderId\": 0}"
+Confirmation: The series count bar gauge shows the non-compliant app series count is at least 5x the compliant app count, and the P95 latency panel renders a smooth curve with no NaN values (which would indicate missing or misconfigured histogram buckets).
+
+Expected Outcomes
+The compliant application exposes fewer than 20 unique time series regardless of traffic volume, while the non-compliant application's series count grows linearly with the number of distinct user IDs sent during the traffic generation phase
+All five recording and alerting rules pass promtool check rules validation and appear in the Prometheus rules API response with health: "ok" status
+Troubleshooting
+If the P95 latency panel in Grafana shows NaN or a flat zero line, what does that tell you about the relationship between the histogram bucket boundaries you chose and the actual observed request durations â and how would you use promtool query instant against the raw bucket series to confirm your hypothesis?
+If the HighErrorRate alert never transitions from inactive to pending even after you send requests to the /api/simulate-error endpoint, what is the first PromQL expression you would evaluate manually in the Prometheus UI to determine whether the recording rule is producing a non-zero value, and what label mismatch between the rule's selector and the actual metric labels could explain a persistent zero result?
+Conclusion
+This lab demonstrated that metric cardinality is an architectural decision, not a configuration detail â unbounded label dimensions such as user identifiers or raw URL paths cause memory exhaustion that cannot be corrected after the fact without dropping and re-instrumenting the metric. Recording rules shift aggregation cost from query time to ingestion time, which is the correct trade-off for dashboards and alerts that run continuously. The naming conventions enforced in the compliant application (namespace prefix, unit suffix, bounded label vocabulary) are the minimum standard for any metric intended to survive in a shared Prometheus environment with multiple teams and retention periods measured in weeks.
