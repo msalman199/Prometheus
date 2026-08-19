@@ -1,0 +1,699 @@
+Long-Term Storage with Thanos
+Learning Objectives
+By the end of this lab, you will be able to:
+
+Understand the architecture and benefits of Thanos for long-term metrics storage
+Install and configure Thanos components on a Linux system
+Set up Thanos Sidecar with Prometheus for high availability
+Configure object storage for long-term metrics retention
+Implement Thanos Query for unified metric querying across multiple Prometheus instances
+Set up Thanos Store Gateway for historical data access
+Configure Thanos Compactor for data optimization
+Verify the complete Thanos setup and query historical metrics
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Prometheus and monitoring concepts
+Familiarity with Linux command line operations
+Knowledge of YAML configuration files
+Understanding of containerization concepts (Docker)
+Basic networking knowledge (ports, services)
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+Task 1: Install Thanos and Configure it with Prometheus
+Subtask 1.1: System Preparation and Dependencies Installation
+First, let's prepare the system and install necessary dependencies.
+
+# Update the system
+sudo apt update && sudo apt upgrade -y
+
+# Install required packages
+sudo apt install -y wget curl unzip docker.io docker-compose
+
+# Start and enable Docker
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+
+# Apply group changes (you may need to log out and back in)
+newgrp docker
+
+# Create working directories
+mkdir -p ~/thanos-lab/{prometheus,thanos,storage}
+cd ~/thanos-lab
+Subtask 1.2: Install Prometheus
+Download and install Prometheus first, as Thanos works alongside it.
+
+# Download Prometheus
+cd ~/thanos-lab
+wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
+
+# Extract Prometheus
+tar -xzf prometheus-2.47.0.linux-amd64.tar.gz
+mv prometheus-2.47.0.linux-amd64 prometheus-install
+
+# Copy binaries to system path
+sudo cp prometheus-install/prometheus /usr/local/bin/
+sudo cp prometheus-install/promtool /usr/local/bin/
+
+# Create prometheus user and directories
+sudo useradd --no-create-home --shell /bin/false prometheus
+sudo mkdir -p /etc/prometheus /var/lib/prometheus
+sudo chown prometheus:prometheus /etc/prometheus /var/lib/prometheus
+Subtask 1.3: Configure Prometheus for Thanos Integration
+Create a Prometheus configuration that's compatible with Thanos.
+
+# Create Prometheus configuration
+sudo tee /etc/prometheus/prometheus.yml > /dev/null <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'thanos-lab'
+    replica: 'prometheus-1'
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+  
+  - job_name: 'thanos-sidecar'
+    static_configs:
+      - targets: ['localhost:10902']
+  
+  - job_name: 'thanos-query'
+    static_configs:
+      - targets: ['localhost:10904']
+EOF
+
+# Set proper ownership
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Subtask 1.4: Install Node Exporter for Metrics
+Install Node Exporter to generate some metrics for testing.
+
+# Download Node Exporter
+cd ~/thanos-lab
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+
+# Extract and install
+tar -xzf node_exporter-1.6.1.linux-amd64.tar.gz
+sudo cp node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+
+# Create systemd service for Node Exporter
+sudo tee /etc/systemd/system/node_exporter.service > /dev/null <<EOF
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start Node Exporter
+sudo systemctl daemon-reload
+sudo systemctl start node_exporter
+sudo systemctl enable node_exporter
+Subtask 1.5: Download and Install Thanos
+Now let's download and install Thanos components.
+
+# Download Thanos
+cd ~/thanos-lab
+wget https://github.com/thanos-io/thanos/releases/download/v0.32.4/thanos-0.32.4.linux-amd64.tar.gz
+
+# Extract Thanos
+tar -xzf thanos-0.32.4.linux-amd64.tar.gz
+sudo cp thanos-0.32.4.linux-amd64/thanos /usr/local/bin/
+
+# Verify installation
+thanos --version
+Subtask 1.6: Set Up MinIO for Object Storage
+Thanos requires object storage. We'll use MinIO as a local S3-compatible storage.
+
+# Download and install MinIO
+cd ~/thanos-lab
+wget https://dl.min.io/server/minio/release/linux-amd64/minio
+chmod +x minio
+sudo mv minio /usr/local/bin/
+
+# Create MinIO directories
+mkdir -p ~/thanos-lab/storage/minio-data
+
+# Create MinIO configuration
+mkdir -p ~/.minio
+
+# Start MinIO server
+cd ~/thanos-lab/storage
+nohup minio server minio-data --address :9000 --console-address :9001 > minio.log 2>&1 &
+
+# Wait for MinIO to start
+sleep 10
+
+# Check if MinIO is running
+curl -I http://localhost:9000/minio/health/live
+Subtask 1.7: Configure MinIO and Create Bucket
+Set up MinIO client and create a bucket for Thanos.
+
+# Download MinIO client
+cd ~/thanos-lab
+wget https://dl.min.io/client/mc/release/linux-amd64/mc
+chmod +x mc
+sudo mv mc /usr/local/bin/
+
+# Configure MinIO client (default credentials: minioadmin/minioadmin)
+mc alias set local http://localhost:9000 minioadmin minioadmin
+
+# Create bucket for Thanos
+mc mb local/thanos-bucket
+
+# Verify bucket creation
+mc ls local/
+Subtask 1.8: Create Thanos Object Storage Configuration
+Create the configuration file for Thanos to use MinIO.
+
+# Create Thanos bucket configuration
+mkdir -p ~/thanos-lab/thanos/config
+
+tee ~/thanos-lab/thanos/config/bucket.yml > /dev/null <<EOF
+type: S3
+config:
+  bucket: "thanos-bucket"
+  endpoint: "localhost:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin"
+  insecure: true
+  signature_version2: false
+  http_config:
+    idle_conn_timeout: 90s
+    response_header_timeout: 2m
+    insecure_skip_verify: true
+EOF
+Task 2: Set Up High-Availability Prometheus with Thanos
+Subtask 2.1: Create Prometheus Systemd Service with Thanos Integration
+Create a systemd service for Prometheus that enables external labels and remote write.
+
+# Create Prometheus systemd service
+sudo tee /etc/systemd/system/prometheus.service > /dev/null <<EOF
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \\
+    --config.file=/etc/prometheus/prometheus.yml \\
+    --storage.tsdb.path=/var/lib/prometheus/ \\
+    --web.console.templates=/etc/prometheus/consoles \\
+    --web.console.libraries=/etc/prometheus/console_libraries \\
+    --web.listen-address=0.0.0.0:9090 \\
+    --web.enable-lifecycle \\
+    --storage.tsdb.min-block-duration=2h \\
+    --storage.tsdb.max-block-duration=2h \\
+    --storage.tsdb.retention.time=6h
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start Prometheus
+sudo systemctl daemon-reload
+sudo systemctl start prometheus
+sudo systemctl enable prometheus
+
+# Check Prometheus status
+sudo systemctl status prometheus
+Subtask 2.2: Configure and Start Thanos Sidecar
+The Thanos Sidecar runs alongside Prometheus and uploads data to object storage.
+
+# Create Thanos Sidecar systemd service
+sudo tee /etc/systemd/system/thanos-sidecar.service > /dev/null <<EOF
+[Unit]
+Description=Thanos Sidecar
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/thanos sidecar \\
+    --tsdb.path=/var/lib/prometheus \\
+    --prometheus.url=http://localhost:9090 \\
+    --grpc-address=0.0.0.0:10901 \\
+    --http-address=0.0.0.0:10902 \\
+    --objstore.config-file=/home/$USER/thanos-lab/thanos/config/bucket.yml
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start Thanos Sidecar
+sudo systemctl daemon-reload
+sudo systemctl start thanos-sidecar
+sudo systemctl enable thanos-sidecar
+
+# Check Thanos Sidecar status
+sudo systemctl status thanos-sidecar
+Subtask 2.3: Set Up Thanos Query
+Thanos Query provides a unified query interface across multiple Prometheus instances.
+
+# Create Thanos Query systemd service
+sudo tee /etc/systemd/system/thanos-query.service > /dev/null <<EOF
+[Unit]
+Description=Thanos Query
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/thanos query \\
+    --http-address=0.0.0.0:10904 \\
+    --grpc-address=0.0.0.0:10903 \\
+    --store=localhost:10901 \\
+    --store=localhost:10905
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Start Thanos Query
+sudo systemctl daemon-reload
+sudo systemctl start thanos-query
+sudo systemctl enable thanos-query
+
+# Check Thanos Query status
+sudo systemctl status thanos-query
+Subtask 2.4: Configure Thanos Store Gateway
+The Store Gateway provides access to historical data stored in object storage.
+
+# Create Thanos Store Gateway systemd service
+sudo tee /etc/systemd/system/thanos-store.service > /dev/null <<EOF
+[Unit]
+Description=Thanos Store Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/thanos store \\
+    --data-dir=/var/lib/thanos/store \\
+    --objstore.config-file=/home/$USER/thanos-lab/thanos/config/bucket.yml \\
+    --http-address=0.0.0.0:10906 \\
+    --grpc-address=0.0.0.0:10905
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create data directory for Store Gateway
+sudo mkdir -p /var/lib/thanos/store
+sudo chown prometheus:prometheus /var/lib/thanos/store
+
+# Start Thanos Store Gateway
+sudo systemctl daemon-reload
+sudo systemctl start thanos-store
+sudo systemctl enable thanos-store
+
+# Check Thanos Store Gateway status
+sudo systemctl status thanos-store
+Subtask 2.5: Set Up Thanos Compactor
+The Compactor optimizes data in object storage by compacting and downsampling.
+
+# Create Thanos Compactor systemd service
+sudo tee /etc/systemd/system/thanos-compactor.service > /dev/null <<EOF
+[Unit]
+Description=Thanos Compactor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/thanos compact \\
+    --data-dir=/var/lib/thanos/compactor \\
+    --objstore.config-file=/home/$USER/thanos-lab/thanos/config/bucket.yml \\
+    --http-address=0.0.0.0:10907 \\
+    --wait
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create data directory for Compactor
+sudo mkdir -p /var/lib/thanos/compactor
+sudo chown prometheus:prometheus /var/lib/thanos/compactor
+
+# Start Thanos Compactor
+sudo systemctl daemon-reload
+sudo systemctl start thanos-compactor
+sudo systemctl enable thanos-compactor
+
+# Check Thanos Compactor status
+sudo systemctl status thanos-compactor
+Subtask 2.6: Verify All Services Are Running
+Let's check that all components are running properly.
+
+# Check all service statuses
+echo "=== Service Status Check ==="
+sudo systemctl status prometheus --no-pager -l
+echo ""
+sudo systemctl status node_exporter --no-pager -l
+echo ""
+sudo systemctl status thanos-sidecar --no-pager -l
+echo ""
+sudo systemctl status thanos-query --no-pager -l
+echo ""
+sudo systemctl status thanos-store --no-pager -l
+echo ""
+sudo systemctl status thanos-compactor --no-pager -l
+
+# Check if all ports are listening
+echo "=== Port Status Check ==="
+netstat -tlnp | grep -E "(9090|9100|10901|10902|10903|10904|10905|10906|10907|9000)"
+Subtask 2.7: Test Thanos Query Interface
+Access the Thanos Query interface to verify everything is working.
+
+# Test Thanos Query API
+echo "=== Testing Thanos Query API ==="
+curl -s "http://localhost:10904/api/v1/stores" | python3 -m json.tool
+
+# Test a simple query
+echo "=== Testing Prometheus Metrics Query ==="
+curl -s "http://localhost:10904/api/v1/query?query=up" | python3 -m json.tool
+
+# Check Thanos Query web interface status
+echo "=== Thanos Query Web Interface ==="
+curl -I http://localhost:10904/
+Subtask 2.8: Generate Some Historical Data
+Let's generate some load to create data that will be uploaded to object storage.
+
+# Create a script to generate some load
+tee ~/thanos-lab/generate_load.sh > /dev/null <<'EOF'
+#!/bin/bash
+echo "Generating load for metrics collection..."
+for i in {1..100}; do
+    # Generate CPU load
+    dd if=/dev/zero of=/dev/null bs=1M count=100 &
+    sleep 1
+    kill $! 2>/dev/null
+    
+    # Generate some file operations
+    echo "Test data $i" > /tmp/test_file_$i
+    rm -f /tmp/test_file_$i
+    
+    echo "Generated load iteration $i"
+    sleep 2
+done
+echo "Load generation complete"
+EOF
+
+chmod +x ~/thanos-lab/generate_load.sh
+
+# Run the load generator in background
+nohup ~/thanos-lab/generate_load.sh > ~/thanos-lab/load_generation.log 2>&1 &
+
+echo "Load generation started. Check progress with: tail -f ~/thanos-lab/load_generation.log"
+Subtask 2.9: Wait for Data Upload and Verify Object Storage
+Wait for Thanos to upload some data blocks to MinIO.
+
+# Wait for data to be uploaded (this may take a few minutes)
+echo "Waiting for Thanos to upload data blocks to object storage..."
+sleep 300  # Wait 5 minutes
+
+# Check if data has been uploaded to MinIO
+echo "=== Checking Object Storage Contents ==="
+mc ls local/thanos-bucket/ --recursive
+
+# Check Thanos Sidecar logs for upload activity
+echo "=== Thanos Sidecar Recent Logs ==="
+sudo journalctl -u thanos-sidecar --no-pager -l --since "10 minutes ago"
+Subtask 2.10: Test Historical Data Query
+Test querying historical data through Thanos.
+
+# Query current data
+echo "=== Querying Current Data ==="
+curl -s "http://localhost:10904/api/v1/query?query=node_cpu_seconds_total" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+print(f'Status: {data[\"status\"]}')
+print(f'Result Type: {data[\"data\"][\"resultType\"]}')
+print(f'Number of series: {len(data[\"data\"][\"result\"])}')
+"
+
+# Query data over time range
+echo "=== Querying Historical Data ==="
+END_TIME=$(date +%s)
+START_TIME=$((END_TIME - 3600))  # 1 hour ago
+
+curl -s "http://localhost:10904/api/v1/query_range?query=node_cpu_seconds_total&start=${START_TIME}&end=${END_TIME}&step=60" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+print(f'Status: {data[\"status\"]}')
+print(f'Result Type: {data[\"data\"][\"resultType\"]}')
+if data['data']['result']:
+    print(f'Number of series: {len(data[\"data\"][\"result\"])}')
+    print(f'Number of data points in first series: {len(data[\"data\"][\"result\"][0][\"values\"])}')
+else:
+    print('No data found')
+"
+Verification and Testing
+Verify Complete Setup
+Let's perform comprehensive verification of the Thanos setup.
+
+# Create verification script
+tee ~/thanos-lab/verify_setup.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+echo "=== Thanos Setup Verification ==="
+echo ""
+
+# Check all services
+echo "1. Service Status:"
+services=("prometheus" "node_exporter" "thanos-sidecar" "thanos-query" "thanos-store" "thanos-compactor")
+for service in "${services[@]}"; do
+    if systemctl is-active --quiet $service; then
+        echo "   ✓ $service is running"
+    else
+        echo "   ✗ $service is not running"
+    fi
+done
+
+echo ""
+echo "2. Port Connectivity:"
+ports=("9090:Prometheus" "9100:Node Exporter" "10902:Thanos Sidecar" "10904:Thanos Query" "10906:Thanos Store" "10907:Thanos Compactor" "9000:MinIO")
+for port_desc in "${ports[@]}"; do
+    port=$(echo $port_desc | cut -d: -f1)
+    desc=$(echo $port_desc | cut -d: -f2)
+    if nc -z localhost $port 2>/dev/null; then
+        echo "   ✓ $desc (port $port) is accessible"
+    else
+        echo "   ✗ $desc (port $port) is not accessible"
+    fi
+done
+
+echo ""
+echo "3. Object Storage:"
+bucket_contents=$(mc ls local/thanos-bucket/ 2>/dev/null | wc -l)
+if [ $bucket_contents -gt 0 ]; then
+    echo "   ✓ Object storage contains $bucket_contents items"
+else
+    echo "   ⚠ Object storage is empty (may need more time for data upload)"
+fi
+
+echo ""
+echo "4. Thanos Query Stores:"
+stores_response=$(curl -s "http://localhost:10904/api/v1/stores" 2>/dev/null)
+if echo "$stores_response" | grep -q "sidecar"; then
+    echo "   ✓ Thanos Query can see sidecar store"
+else
+    echo "   ✗ Thanos Query cannot see sidecar store"
+fi
+
+echo ""
+echo "5. Sample Query Test:"
+query_response=$(curl -s "http://localhost:10904/api/v1/query?query=up" 2>/dev/null)
+if echo "$query_response" | grep -q '"status":"success"'; then
+    echo "   ✓ Sample query executed successfully"
+else
+    echo "   ✗ Sample query failed"
+fi
+
+echo ""
+echo "=== Verification Complete ==="
+EOF
+
+chmod +x ~/thanos-lab/verify_setup.sh
+~/thanos-lab/verify_setup.sh
+Access Web Interfaces
+echo "=== Web Interface Access Information ==="
+echo ""
+echo "You can access the following web interfaces:"
+echo "1. Prometheus: http://localhost:9090"
+echo "2. Thanos Query: http://localhost:10904"
+echo "3. Thanos Sidecar: http://localhost:10902"
+echo "4. Thanos Store Gateway: http://localhost:10906"
+echo "5. Thanos Compactor: http://localhost:10907"
+echo "6. MinIO Console: http://localhost:9001 (admin/admin123)"
+echo ""
+echo "To access from outside the lab environment, you may need to set up port forwarding."
+Troubleshooting Common Issues
+Issue 1: Services Not Starting
+# Check service logs
+sudo journalctl -u prometheus -f
+sudo journalctl -u thanos-sidecar -f
+sudo journalctl -u thanos-query -f
+Issue 2: Object Storage Connection Issues
+# Test MinIO connectivity
+curl -I http://localhost:9000/minio/health/live
+
+# Check bucket configuration
+cat ~/thanos-lab/thanos/config/bucket.yml
+
+# Test bucket access
+mc ls local/thanos-bucket/
+Issue 3: No Data in Object Storage
+# Check Prometheus data directory
+sudo ls -la /var/lib/prometheus/
+
+# Check Thanos Sidecar logs for upload activity
+sudo journalctl -u thanos-sidecar --since "1 hour ago" | grep -i upload
+
+# Verify Prometheus is generating blocks
+sudo ls -la /var/lib/prometheus/01*
+Issue 4: Query Issues
+# Test direct Prometheus query
+curl "http://localhost:9090/api/v1/query?query=up"
+
+# Test Thanos Query
+curl "http://localhost:10904/api/v1/query?query=up"
+
+# Check Thanos Query stores
+curl "http://localhost:10904/api/v1/stores"
+Advanced Configuration
+Configure Retention Policies
+# Create advanced retention configuration
+tee ~/thanos-lab/thanos/config/retention.yml > /dev/null <<EOF
+retention:
+  raw: 30d
+  5m: 90d
+  1h: 1y
+EOF
+Set Up Alerting Rules
+# Create alerting rules for Thanos
+sudo mkdir -p /etc/prometheus/rules
+
+sudo tee /etc/prometheus/rules/thanos.yml > /dev/null <<EOF
+groups:
+- name: thanos
+  rules:
+  - alert: ThanosQueryHttpRequestQueryErrorRateHigh
+    expr: |
+      (
+        sum(rate(http_requests_total{code=~"5..", job=~"thanos-query.*", handler="query"}[5m]))
+      /
+        sum(rate(http_requests_total{job=~"thanos-query.*", handler="query"}[5m]))
+      ) > 0.05
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: Thanos Query is failing to handle requests.
+
+  - alert: ThanosStoreGrpcErrorRateHigh
+    expr: |
+      (
+        sum(rate(grpc_server_handled_total{grpc_code=~"Unknown|ResourceExhausted|Internal|Unavailable|DataLoss|DeadlineExceeded", job=~"thanos-store.*"}[5m]))
+      /
+        sum(rate(grpc_server_started_total{job=~"thanos-store.*"}[5m]))
+      ) > 0.05
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: Thanos Store is failing to handle requests.
+EOF
+
+# Update Prometheus configuration to include rules
+sudo sed -i '/rule_files:/a\  - "/etc/prometheus/rules/*.yml"' /etc/prometheus/prometheus.yml
+
+# Reload Prometheus configuration
+curl -X POST http://localhost:9090/-/reload
+Performance Monitoring
+Monitor Thanos Components
+# Create monitoring script
+tee ~/thanos-lab/monitor_thanos.sh > /dev/null <<'EOF'
+#!/bin/bash
+
+echo "=== Thanos Components Monitoring ==="
+echo ""
+
+echo "1. Memory Usage:"
+ps aux | grep -E "(prometheus|thanos)" | grep -v grep | awk '{print $11 " - RSS: " $6/1024 " MB, VSZ: " $5/1024 " MB"}'
+
+echo ""
+echo "2. Disk Usage:"
+echo "Prometheus data: $(du -sh /var/lib/prometheus/ 2>/dev/null | cut -f1)"
+echo "Thanos store data: $(du -sh /var/lib/thanos/ 2>/dev/null | cut -f1)"
+echo "MinIO data: $(du -sh ~/thanos-lab/storage/minio-data/ 2>/dev/null | cut -f1)"
+
+echo ""
+echo "3. Network Connections:"
+netstat -tlnp | grep -E "(9090|10901|10902|10903|10904|10905|10906|10907)" | wc -l | xargs echo "Active connections:"
+
+echo ""
+echo "4. Object Storage Stats:"
+mc ls local/thanos-bucket/ --recursive 2>/dev/null | wc -l | xargs echo "Objects in storage:"
+
+echo ""
+echo "5. Recent Errors (last 10 minutes):"
+sudo journalctl --since "10 minutes ago" | grep -i error | grep -E "(prometheus|thanos)" | wc -l | xargs echo "Error count:"
+EOF
+
+chmod +x ~/thanos-lab/monitor_thanos.sh
+~/thanos-lab/monitor_thanos.sh
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Installed and configured Thanos with all its essential components including Sidecar, Query, Store Gateway, and Compactor
+Set up high-availability Prometheus with external labels and proper retention settings for Thanos integration
+Configured object storage using MinIO as an S3-compatible backend for long-term metrics storage
+Implemented a complete monitoring stack that provides unified querying across multiple data sources
+Established long-term data retention with automatic data upload and compaction capabilities
+Verified the entire setup through comprehensive testing and monitoring
+Key Benefits Achieved:
+
+Long-term Storage: Metrics are now stored indefinitely in object storage, beyond Prometheus's local retention limits
+High Availability: Multiple Prometheus instances can be queried through a single Thanos Query interface
+Cost Efficiency: Automatic data compaction and downsampling reduce storage costs over time
+Scalability: The architecture can easily scale to handle multiple Prometheus instances across different clusters
+Unified Querying: Historical and real-time data can be queried seamlessly through the Thanos Query interface
+Real-world Applications:
+
+This setup is essential for production environments where you need to retain metrics for compliance, capacity planning, or long-term trend analysis. Organizations use Thanos to manage petabytes of metrics data across multiple Kubernetes clusters, providing a centralized observability platform that scales with their infrastructure.
+
+The skills you've learned in this lab are directly applicable to enterprise monitoring solutions, where Thanos has become the de facto standard for Prometheus long-term storage and high availability. You now have hands-on experience with a production-ready monitoring architecture that can handle the demands of modern cloud-native applications.
