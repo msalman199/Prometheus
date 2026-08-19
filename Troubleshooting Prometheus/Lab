@@ -1,0 +1,546 @@
+: Troubleshooting Prometheus
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Use promtool to validate and check Prometheus configuration files
+Identify and troubleshoot common Prometheus scraping issues
+Diagnose configuration problems using Prometheus debugging tools
+Implement fixes for typical Prometheus deployment issues
+Understand Prometheus logging and error reporting mechanisms
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with YAML configuration file format
+Basic knowledge of Prometheus concepts (metrics, targets, scraping)
+Understanding of HTTP status codes and networking basics
+Experience with text editors like nano or vim
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Task 1: Setting Up Prometheus Environment and Installing Tools
+Subtask 1.1: Install Prometheus and Required Tools
+First, we need to install Prometheus and set up our testing environment.
+
+# Update system packages
+sudo apt update
+
+# Create prometheus user
+sudo useradd --no-create-home --shell /bin/false prometheus
+
+# Create directories for Prometheus
+sudo mkdir /etc/prometheus
+sudo mkdir /var/lib/prometheus
+sudo chown prometheus:prometheus /etc/prometheus
+sudo chown prometheus:prometheus /var/lib/prometheus
+
+# Download and install Prometheus
+cd /tmp
+wget https://github.com/prometheus/prometheus/releases/download/v2.45.0/prometheus-2.45.0.linux-amd64.tar.gz
+tar xvf prometheus-2.45.0.linux-amd64.tar.gz
+cd prometheus-2.45.0.linux-amd64
+
+# Copy binaries to system directories
+sudo cp prometheus /usr/local/bin/
+sudo cp promtool /usr/local/bin/
+sudo chown prometheus:prometheus /usr/local/bin/prometheus
+sudo chown prometheus:prometheus /usr/local/bin/promtool
+
+# Copy configuration files
+sudo cp -r consoles /etc/prometheus
+sudo cp -r console_libraries /etc/prometheus
+sudo chown -R prometheus:prometheus /etc/prometheus/consoles
+sudo chown -R prometheus:prometheus /etc/prometheus/console_libraries
+Subtask 1.2: Create Initial Prometheus Configuration
+Create a basic Prometheus configuration file that we will use for troubleshooting exercises.
+
+# Create the main configuration file
+sudo nano /etc/prometheus/prometheus.yml
+Add the following configuration:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+
+  - job_name: 'broken-target'
+    static_configs:
+      - targets: ['localhost:8080']
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  - job_name: 'invalid-config'
+    static_configs:
+      - targets: ['invalid-hostname:9090']
+    metrics_path: '/invalid/path'
+Set proper ownership:
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Subtask 1.3: Install Node Exporter for Testing
+Install Node Exporter to have a working target for our tests.
+
+# Download and install Node Exporter
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.0/node_exporter-1.6.0.linux-amd64.tar.gz
+tar xvf node_exporter-1.6.0.linux-amd64.tar.gz
+sudo cp node_exporter-1.6.0.linux-amd64/node_exporter /usr/local/bin/
+sudo chown prometheus:prometheus /usr/local/bin/node_exporter
+Create a systemd service for Node Exporter:
+
+sudo nano /etc/systemd/system/node_exporter.service
+Add the following content:
+
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+Enable and start Node Exporter:
+
+sudo systemctl daemon-reload
+sudo systemctl enable node_exporter
+sudo systemctl start node_exporter
+sudo systemctl status node_exporter
+Task 2: Using Promtool to Check Configuration Files
+Subtask 2.1: Basic Configuration Validation
+Promtool is Prometheus's built-in configuration validation and debugging tool. Let's start by checking our current configuration.
+
+# Check if the configuration file is syntactically correct
+promtool check config /etc/prometheus/prometheus.yml
+You should see output indicating whether the configuration is valid or contains errors.
+
+Subtask 2.2: Create Intentionally Broken Configurations
+Let's create some broken configurations to practice troubleshooting.
+
+Create a configuration with syntax errors:
+
+sudo nano /etc/prometheus/broken-syntax.yml
+Add the following intentionally broken YAML:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  # Missing closing bracket and invalid indentation
+  - job_name: 'broken-job'
+    static_configs
+      - targets: ['localhost:9100'
+    scrape_interval: invalid_value
+Test this broken configuration:
+
+promtool check config /etc/prometheus/broken-syntax.yml
+Observe the error messages and understand what each error means.
+
+Subtask 2.3: Create Configuration with Logical Errors
+Create another configuration file with logical errors:
+
+sudo nano /etc/prometheus/logical-errors.yml
+Add the following configuration:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'duplicate-job'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'duplicate-job'  # Duplicate job name
+    static_configs:
+      - targets: ['localhost:9100']
+
+  - job_name: 'invalid-timeout'
+    static_configs:
+      - targets: ['localhost:9091']
+    scrape_timeout: 30s  # Timeout longer than interval
+    scrape_interval: 15s
+Test this configuration:
+
+promtool check config /etc/prometheus/logical-errors.yml
+Subtask 2.4: Using Promtool for Rules Validation
+Create a rules file to test rule validation:
+
+sudo mkdir -p /etc/prometheus/rules
+sudo nano /etc/prometheus/rules/test-rules.yml
+Add some intentionally broken rules:
+
+groups:
+  - name: test-rules
+    rules:
+      - alert: HighCPUUsage
+        expr: cpu_usage > 0.8  # This metric doesn't exist
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage detected"
+
+      - alert: InvalidSyntax
+        expr: invalid_metric_name{job=}  # Invalid syntax
+        for: 2m
+Check the rules file:
+
+promtool check rules /etc/prometheus/rules/test-rules.yml
+Task 3: Troubleshooting Scraping Issues
+Subtask 3.1: Create Prometheus Systemd Service
+Create a systemd service for Prometheus:
+
+sudo nano /etc/systemd/system/prometheus.service
+Add the following content:
+
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+Enable and start Prometheus:
+
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus
+sudo systemctl start prometheus
+Subtask 3.2: Identify Scraping Issues
+Check Prometheus service status:
+
+sudo systemctl status prometheus
+If there are issues, check the logs:
+
+sudo journalctl -u prometheus -f
+Access Prometheus web interface to check target status. First, check if Prometheus is running:
+
+curl http://localhost:9090/api/v1/targets
+Subtask 3.3: Analyze Target Status
+Use curl to check individual targets:
+
+# Check if Node Exporter is responding
+curl http://localhost:9100/metrics
+
+# Check the broken target (should fail)
+curl http://localhost:8080/metrics
+
+# Check invalid hostname (should fail)
+curl http://invalid-hostname:9090/metrics
+Subtask 3.4: Fix Common Configuration Problems
+Let's fix the issues in our configuration. Create a corrected version:
+
+sudo nano /etc/prometheus/prometheus-fixed.yml
+Add the corrected configuration:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+
+  # Removed broken targets and added proper configuration
+  - job_name: 'prometheus-self'
+    static_configs:
+      - targets: ['localhost:9090']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+Validate the fixed configuration:
+
+promtool check config /etc/prometheus/prometheus-fixed.yml
+Subtask 3.5: Implement Configuration Reload
+Replace the current configuration with the fixed version:
+
+sudo cp /etc/prometheus/prometheus-fixed.yml /etc/prometheus/prometheus.yml
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Reload Prometheus configuration without restarting:
+
+curl -X POST http://localhost:9090/-/reload
+Check if the reload was successful:
+
+sudo journalctl -u prometheus --since "1 minute ago"
+Task 4: Advanced Troubleshooting Techniques
+Subtask 4.1: Debug Scraping with Verbose Logging
+Stop Prometheus and run it with debug logging:
+
+sudo systemctl stop prometheus
+
+# Run Prometheus in foreground with debug logging
+sudo -u prometheus /usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --log.level=debug
+Let it run for a minute to see debug output, then stop it with Ctrl+C.
+
+Subtask 4.2: Use Promtool for Query Testing
+Test queries using promtool:
+
+# Start Prometheus service again
+sudo systemctl start prometheus
+
+# Wait for Prometheus to start
+sleep 10
+
+# Test instant queries
+promtool query instant http://localhost:9090 'up'
+
+# Test range queries
+promtool query range http://localhost:9090 'up' --start=2023-01-01T00:00:00Z --end=2023-01-01T01:00:00Z
+Subtask 4.3: Create Monitoring Script
+Create a script to monitor Prometheus health:
+
+nano prometheus-health-check.sh
+Add the following script:
+
+#!/bin/bash
+
+echo "=== Prometheus Health Check ==="
+echo "Date: $(date)"
+echo
+
+# Check if Prometheus is running
+echo "1. Checking Prometheus service status:"
+systemctl is-active prometheus
+echo
+
+# Check if Prometheus port is listening
+echo "2. Checking if Prometheus port 9090 is listening:"
+netstat -tlnp | grep :9090 || echo "Port 9090 not listening"
+echo
+
+# Check Prometheus API health
+echo "3. Checking Prometheus API health:"
+curl -s http://localhost:9090/-/healthy || echo "API health check failed"
+echo
+
+# Check configuration validity
+echo "4. Checking configuration validity:"
+promtool check config /etc/prometheus/prometheus.yml
+echo
+
+# Check targets status
+echo "5. Checking targets status:"
+curl -s http://localhost:9090/api/v1/targets | python3 -m json.tool 2>/dev/null || echo "Failed to get targets status"
+echo
+
+# Check recent logs for errors
+echo "6. Recent error logs:"
+journalctl -u prometheus --since "5 minutes ago" --no-pager | grep -i error || echo "No recent errors found"
+Make the script executable and run it:
+
+chmod +x prometheus-health-check.sh
+./prometheus-health-check.sh
+Subtask 4.4: Troubleshoot Common Issues
+Create scenarios for common issues and their solutions:
+
+# Create a script that simulates common problems
+nano simulate-problems.sh
+Add the following content:
+
+#!/bin/bash
+
+echo "Simulating common Prometheus problems..."
+
+# Problem 1: Configuration file permissions
+echo "1. Testing configuration file permission issues:"
+sudo chmod 600 /etc/prometheus/prometheus.yml
+sudo systemctl restart prometheus
+sleep 5
+sudo systemctl status prometheus
+echo "Fix: Restore proper permissions"
+sudo chmod 644 /etc/prometheus/prometheus.yml
+sudo systemctl restart prometheus
+echo
+
+# Problem 2: Port already in use
+echo "2. Testing port conflict:"
+# This would normally cause issues if another service uses port 9090
+netstat -tlnp | grep :9090
+echo
+
+# Problem 3: Invalid configuration
+echo "3. Testing invalid configuration:"
+sudo cp /etc/prometheus/broken-syntax.yml /etc/prometheus/prometheus.yml
+promtool check config /etc/prometheus/prometheus.yml
+echo "Fix: Restore valid configuration"
+sudo cp /etc/prometheus/prometheus-fixed.yml /etc/prometheus/prometheus.yml
+promtool check config /etc/prometheus/prometheus.yml
+Make it executable and run:
+
+chmod +x simulate-problems.sh
+./simulate-problems.sh
+Task 5: Creating Comprehensive Troubleshooting Documentation
+Subtask 5.1: Document Common Issues and Solutions
+Create a troubleshooting guide:
+
+nano prometheus-troubleshooting-guide.md
+Add comprehensive troubleshooting information:
+
+# Prometheus Troubleshooting Guide
+
+## Common Issues and Solutions
+
+### 1. Configuration Issues
+
+**Problem**: Prometheus fails to start due to configuration errors
+**Symptoms**: Service fails to start, error logs show configuration parsing errors
+**Solution**: 
+- Use `promtool check config /etc/prometheus/prometheus.yml`
+- Fix YAML syntax errors
+- Validate job names are unique
+- Ensure scrape_timeout < scrape_interval
+
+### 2. Target Scraping Issues
+
+**Problem**: Targets show as "DOWN" in Prometheus
+**Symptoms**: Targets appear red in web UI, no metrics collected
+**Solution**:
+- Check if target service is running
+- Verify network connectivity: `curl http://target:port/metrics`
+- Check firewall rules
+- Validate metrics endpoint path
+
+### 3. Permission Issues
+
+**Problem**: Prometheus cannot read configuration or write data
+**Symptoms**: Permission denied errors in logs
+**Solution**:
+- Ensure prometheus user owns configuration files
+- Check data directory permissions
+- Verify systemd service user configuration
+
+### 4. Resource Issues
+
+**Problem**: Prometheus runs out of memory or disk space
+**Symptoms**: OOM kills, slow queries, startup failures
+**Solution**:
+- Monitor resource usage
+- Adjust retention policies
+- Optimize queries
+- Scale storage
+
+## Debugging Commands
+
+```bash
+# Check configuration
+promtool check config /etc/prometheus/prometheus.yml
+
+# Check service status
+systemctl status prometheus
+
+# View logs
+journalctl -u prometheus -f
+
+# Test connectivity
+curl http://localhost:9090/-/healthy
+
+# Check targets
+curl http://localhost:9090/api/v1/targets
+
+### Subtask 5.2: Create Automated Diagnostic Script
+
+Create a comprehensive diagnostic script:
+
+```bash
+nano prometheus-diagnostics.sh
+Add the following comprehensive diagnostic script:
+
+#!/bin/bash
+
+LOG_FILE="/tmp/prometheus-diagnostics-$(date +%Y%m%d-%H%M%S).log"
+
+echo "Prometheus Comprehensive Diagnostics" | tee $LOG_FILE
+echo "=====================================" | tee -a $LOG_FILE
+echo "Timestamp: $(date)" | tee -a $LOG_FILE
+echo "Hostname: $(hostname)" | tee -a $LOG_FILE
+echo | tee -a $LOG_FILE
+
+# Function to run command and log output
+run_check() {
+    echo "--- $1 ---" | tee -a $LOG_FILE
+    eval $2 2>&1 | tee -a $LOG_FILE
+    echo | tee -a $LOG_FILE
+}
+
+# System checks
+run_check "System Information" "uname -a"
+run_check "Memory Usage" "free -h"
+run_check "Disk Usage" "df -h"
+run_check "CPU Information" "lscpu | head -10"
+
+# Prometheus service checks
+run_check "Prometheus Service Status" "systemctl status prometheus --no-pager"
+run_check "Prometheus Process" "ps aux | grep prometheus"
+run_check "Network Listening Ports" "netstat -tlnp | grep -E ':(9090|9100)'"
+
+# Configuration checks
+run_check "Configuration Validation" "promtool check config /etc/prometheus/prometheus.yml"
+run_check "Configuration File Permissions" "ls -la /etc/prometheus/prometheus.yml"
+run_check "Data Directory Permissions" "ls -la /var/lib/prometheus/"
+
+# Connectivity checks
+run_check "Prometheus Health Check" "curl -s http://localhost:9090/-/healthy"
+run_check "Prometheus Ready Check" "curl -s http://localhost:9090/-/ready"
+run_check "Node Exporter Check" "curl -s http://localhost:9100/metrics | head -5"
+
+# Recent logs
+run_check "Recent Prometheus Logs" "journalctl -u prometheus --since '10 minutes ago' --no-pager"
+
+echo "Diagnostics complete. Full log saved to: $LOG_FILE" | tee -a $LOG_FILE
+Make it executable and run:
+
+chmod +x prometheus-diagnostics.sh
+./prometheus-diagnostics.sh
+Conclusion
+In this lab, you have successfully learned how to troubleshoot Prometheus deployments using various tools and techniques. You have gained hands-on experience with:
+
+Promtool validation: Using Prometheus's built-in tool to validate configurations and identify syntax errors
+Configuration troubleshooting: Identifying and fixing common configuration problems including syntax errors, logical errors, and invalid parameters
+Scraping issue diagnosis: Understanding how to identify why targets are failing and implementing fixes
+Advanced debugging techniques: Using verbose logging, health checks, and monitoring scripts to diagnose complex issues
+Systematic troubleshooting: Creating comprehensive diagnostic procedures and documentation
+These skills are essential for maintaining reliable Prometheus monitoring infrastructure in production environments. The troubleshooting techniques you've learned will help you quickly identify and resolve issues, ensuring your monitoring system remains operational and provides accurate metrics for your applications and infrastructure.
+
+The diagnostic scripts and troubleshooting guides you created can be adapted and used in real-world scenarios to maintain Prometheus deployments effectively. Understanding these troubleshooting methods will make you more confident in deploying and managing Prometheus in production environments.
