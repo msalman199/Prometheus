@@ -1,0 +1,598 @@
+Securing Prometheus
+Lab Objectives
+By the end of this lab, students will be able to:
+
+Configure HTTPS encryption for Prometheus server communications
+Implement TLS certificates for secure data transmission
+Set up basic authentication for Prometheus web interface
+Configure role-based access control (RBAC) using reverse proxy
+Understand security best practices for monitoring infrastructure
+Verify secure connections and authentication mechanisms
+Prerequisites
+Before starting this lab, students should have:
+
+Basic understanding of Linux command line operations
+Familiarity with text editors (nano, vim, or similar)
+Knowledge of HTTP/HTTPS protocols
+Understanding of SSL/TLS certificates
+Basic networking concepts
+Previous experience with Prometheus (recommended but not required)
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required software during the lab exercises.
+
+Important Note: All tasks in this lab will be performed on a single Linux machine. No additional virtual machines or remote hosts are required.
+
+Task 1: Configure HTTPS for Prometheus
+Subtask 1.1: Install Required Tools and Dependencies
+First, we need to install Prometheus and the necessary tools for generating SSL certificates.
+
+# Update the system package list
+sudo apt update
+
+# Install required packages
+sudo apt install -y wget curl openssl nginx
+
+# Create a dedicated user for Prometheus
+sudo useradd --no-create-home --shell /bin/false prometheus
+
+# Create necessary directories
+sudo mkdir -p /etc/prometheus /var/lib/prometheus /etc/ssl/prometheus
+
+# Set proper ownership
+sudo chown prometheus:prometheus /etc/prometheus /var/lib/prometheus
+Subtask 1.2: Download and Install Prometheus
+# Download the latest Prometheus release
+cd /tmp
+wget https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz
+
+# Extract the archive
+tar xvf prometheus-2.47.0.linux-amd64.tar.gz
+
+# Copy binaries to system directories
+sudo cp prometheus-2.47.0.linux-amd64/prometheus /usr/local/bin/
+sudo cp prometheus-2.47.0.linux-amd64/promtool /usr/local/bin/
+
+# Copy console files
+sudo cp -r prometheus-2.47.0.linux-amd64/consoles /etc/prometheus/
+sudo cp -r prometheus-2.47.0.linux-amd64/console_libraries /etc/prometheus/
+
+# Set proper ownership and permissions
+sudo chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+sudo chown -R prometheus:prometheus /etc/prometheus/consoles /etc/prometheus/console_libraries
+Subtask 1.3: Generate SSL Certificates
+We will create self-signed certificates for this lab. In production environments, you should use certificates from a trusted Certificate Authority.
+
+# Generate private key
+sudo openssl genrsa -out /etc/ssl/prometheus/prometheus.key 2048
+
+# Generate certificate signing request
+sudo openssl req -new -key /etc/ssl/prometheus/prometheus.key -out /etc/ssl/prometheus/prometheus.csr -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+
+# Generate self-signed certificate
+sudo openssl x509 -req -days 365 -in /etc/ssl/prometheus/prometheus.csr -signkey /etc/ssl/prometheus/prometheus.key -out /etc/ssl/prometheus/prometheus.crt
+
+# Set proper permissions
+sudo chmod 600 /etc/ssl/prometheus/prometheus.key
+sudo chmod 644 /etc/ssl/prometheus/prometheus.crt
+sudo chown -R prometheus:prometheus /etc/ssl/prometheus/
+Subtask 1.4: Create Prometheus Configuration with TLS
+Create a secure Prometheus configuration file:
+
+sudo nano /etc/prometheus/prometheus.yml
+Add the following configuration:
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scheme: https
+    tls_config:
+      cert_file: /etc/ssl/prometheus/prometheus.crt
+      key_file: /etc/ssl/prometheus/prometheus.key
+      insecure_skip_verify: true
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+
+# TLS and authentication configuration
+tls_server_config:
+  cert_file: /etc/ssl/prometheus/prometheus.crt
+  key_file: /etc/ssl/prometheus/prometheus.key
+Set proper ownership:
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+Subtask 1.5: Create Prometheus Service File
+Create a systemd service file for Prometheus:
+
+sudo nano /etc/systemd/system/prometheus.service
+Add the following content:
+
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+Subtask 1.6: Start and Test HTTPS Configuration
+# Reload systemd and start Prometheus
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus
+sudo systemctl start prometheus
+
+# Check service status
+sudo systemctl status prometheus
+
+# Verify Prometheus is listening on port 9090
+sudo netstat -tlnp | grep 9090
+
+# Test HTTPS connection (accept self-signed certificate)
+curl -k https://localhost:9090/metrics
+Task 2: Set up Authentication and RBAC for Secure Access
+Subtask 2.1: Install and Configure Nginx as Reverse Proxy
+We will use Nginx as a reverse proxy to add authentication capabilities to Prometheus.
+
+# Install apache2-utils for htpasswd
+sudo apt install -y apache2-utils
+
+# Create authentication file
+sudo htpasswd -c /etc/nginx/.htpasswd admin
+
+# You will be prompted to enter a password. Use a strong password like: SecurePass123!
+
+# Add additional users if needed
+sudo htpasswd /etc/nginx/.htpasswd viewer
+# Use password: ViewerPass456!
+
+# Verify the authentication file
+sudo cat /etc/nginx/.htpasswd
+Subtask 2.2: Configure Nginx Virtual Host
+Remove the default Nginx configuration and create a new one:
+
+# Remove default configuration
+sudo rm /etc/nginx/sites-enabled/default
+
+# Create new configuration for Prometheus
+sudo nano /etc/nginx/sites-available/prometheus
+Add the following configuration:
+
+upstream prometheus {
+    server 127.0.0.1:9090;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name localhost;
+
+    ssl_certificate /etc/ssl/prometheus/prometheus.crt;
+    ssl_certificate_key /etc/ssl/prometheus/prometheus.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    location / {
+        auth_basic "Prometheus Authentication";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+
+        proxy_pass https://prometheus;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # Handle WebSocket connections
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # Admin-only endpoints
+    location ~ ^/(api/v1/admin|api/v1/write) {
+        auth_basic "Admin Access Required";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        
+        # Only allow admin user
+        if ($remote_user != "admin") {
+            return 403;
+        }
+        
+        proxy_pass https://prometheus;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# Redirect HTTP to HTTPS
+server {
+    listen 80;
+    server_name localhost;
+    return 301 https://$server_name$request_uri;
+}
+Subtask 2.3: Enable and Configure Nginx
+# Enable the site
+sudo ln -s /etc/nginx/sites-available/prometheus /etc/nginx/sites-enabled/
+
+# Test Nginx configuration
+sudo nginx -t
+
+# Start and enable Nginx
+sudo systemctl enable nginx
+sudo systemctl start nginx
+
+# Check Nginx status
+sudo systemctl status nginx
+Subtask 2.4: Configure Advanced RBAC with Multiple User Roles
+Create a more sophisticated authentication setup with different access levels:
+
+# Create separate authentication files for different roles
+sudo htpasswd -c /etc/nginx/.htpasswd-admin admin
+# Password: AdminPass123!
+
+sudo htpasswd -c /etc/nginx/.htpasswd-viewer viewer
+# Password: ViewerPass456!
+
+sudo htpasswd -c /etc/nginx/.htpasswd-readonly readonly
+# Password: ReadOnlyPass789!
+Update the Nginx configuration for role-based access:
+
+sudo nano /etc/nginx/sites-available/prometheus
+Replace the content with this enhanced configuration:
+
+upstream prometheus {
+    server 127.0.0.1:9090;
+}
+
+map $remote_user $user_role {
+    default "none";
+    "admin" "admin";
+    "viewer" "viewer";
+    "readonly" "readonly";
+}
+
+server {
+    listen 443 ssl http2;
+    server_name localhost;
+
+    ssl_certificate /etc/ssl/prometheus/prometheus.crt;
+    ssl_certificate_key /etc/ssl/prometheus/prometheus.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    # Admin access - full permissions
+    location ~ ^/(api/v1/admin|api/v1/write|api/v1/label/__name__/values) {
+        auth_basic "Admin Access Required";
+        auth_basic_user_file /etc/nginx/.htpasswd-admin;
+        
+        proxy_pass https://prometheus;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-User-Role $user_role;
+    }
+
+    # Viewer access - read and query permissions
+    location ~ ^/(api/v1/query|api/v1/query_range|api/v1/series|graph|targets) {
+        auth_basic "Viewer Access Required";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        
+        proxy_pass https://prometheus;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-User-Role $user_role;
+    }
+
+    # Read-only access - metrics and status only
+    location ~ ^/(metrics|api/v1/status) {
+        auth_basic "Authentication Required";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        
+        proxy_pass https://prometheus;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-User-Role $user_role;
+    }
+
+    # Default location - requires authentication
+    location / {
+        auth_basic "Prometheus Authentication";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        
+        proxy_pass https://prometheus;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-User-Role $user_role;
+    }
+}
+
+server {
+    listen 80;
+    server_name localhost;
+    return 301 https://$server_name$request_uri;
+}
+Subtask 2.5: Test Authentication and RBAC
+# Reload Nginx configuration
+sudo nginx -s reload
+
+# Test different authentication scenarios
+
+# Test without authentication (should fail)
+curl -k https://localhost/
+
+# Test with admin credentials
+curl -k -u admin:AdminPass123! https://localhost/api/v1/status/config
+
+# Test with viewer credentials
+curl -k -u viewer:ViewerPass456! https://localhost/api/v1/query?query=up
+
+# Test with readonly credentials
+curl -k -u readonly:ReadOnlyPass789! https://localhost/metrics
+
+# Test admin-only endpoint with viewer credentials (should fail)
+curl -k -u viewer:ViewerPass456! https://localhost/api/v1/admin/tsdb/snapshot
+Subtask 2.6: Install and Configure Node Exporter for Testing
+To have more comprehensive testing, let's install Node Exporter:
+
+# Download Node Exporter
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+
+# Extract and install
+tar xvf node_exporter-1.6.1.linux-amd64.tar.gz
+sudo cp node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/
+
+# Create node_exporter user
+sudo useradd --no-create-home --shell /bin/false node_exporter
+sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+
+# Create systemd service
+sudo nano /etc/systemd/system/node_exporter.service
+Add the following content:
+
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+Start Node Exporter:
+
+sudo systemctl daemon-reload
+sudo systemctl enable node_exporter
+sudo systemctl start node_exporter
+sudo systemctl status node_exporter
+Subtask 2.7: Verify Complete Security Setup
+# Check all services are running
+sudo systemctl status prometheus nginx node_exporter
+
+# Verify SSL certificate
+openssl s_client -connect localhost:443 -servername localhost < /dev/null
+
+# Test the complete authentication flow
+echo "Testing admin access to web interface..."
+curl -k -u admin:AdminPass123! https://localhost/ | grep -i prometheus
+
+echo "Testing viewer access to query API..."
+curl -k -u viewer:ViewerPass456! "https://localhost/api/v1/query?query=up" | head -20
+
+echo "Testing readonly access to metrics..."
+curl -k -u readonly:ReadOnlyPass789! https://localhost/metrics | head -10
+
+# Check security headers
+curl -k -I https://localhost/
+
+# Verify HTTP to HTTPS redirect
+curl -I http://localhost/
+Verification and Testing
+Security Verification Checklist
+Create a verification script to test all security measures:
+
+nano ~/security_test.sh
+Add the following content:
+
+#!/bin/bash
+
+echo "=== Prometheus Security Verification ==="
+echo
+
+# Test 1: HTTPS Configuration
+echo "1. Testing HTTPS Configuration..."
+if curl -k -s https://localhost:9090/metrics > /dev/null; then
+    echo "   ✓ HTTPS is working on port 9090"
+else
+    echo "   ✗ HTTPS failed on port 9090"
+fi
+
+# Test 2: Authentication Required
+echo "2. Testing Authentication Requirements..."
+if curl -k -s https://localhost/ | grep -q "401\|Authentication"; then
+    echo "   ✓ Authentication is required"
+else
+    echo "   ✗ Authentication not enforced"
+fi
+
+# Test 3: Admin Access
+echo "3. Testing Admin Access..."
+if curl -k -s -u admin:AdminPass123! https://localhost/api/v1/status/config | grep -q "global"; then
+    echo "   ✓ Admin can access configuration"
+else
+    echo "   ✗ Admin access failed"
+fi
+
+# Test 4: Viewer Access
+echo "4. Testing Viewer Access..."
+if curl -k -s -u viewer:ViewerPass456! "https://localhost/api/v1/query?query=up" | grep -q "success"; then
+    echo "   ✓ Viewer can query metrics"
+else
+    echo "   ✗ Viewer access failed"
+fi
+
+# Test 5: HTTP to HTTPS Redirect
+echo "5. Testing HTTP to HTTPS Redirect..."
+if curl -s -I http://localhost/ | grep -q "301\|302"; then
+    echo "   ✓ HTTP redirects to HTTPS"
+else
+    echo "   ✗ HTTP redirect not working"
+fi
+
+# Test 6: SSL Certificate
+echo "6. Testing SSL Certificate..."
+if openssl s_client -connect localhost:443 -servername localhost < /dev/null 2>/dev/null | grep -q "Verify return code: 18"; then
+    echo "   ✓ SSL certificate is present (self-signed)"
+else
+    echo "   ✗ SSL certificate verification failed"
+fi
+
+echo
+echo "=== Security Test Complete ==="
+Make the script executable and run it:
+
+chmod +x ~/security_test.sh
+./security_test.sh
+Troubleshooting Common Issues
+Issue 1: Certificate Errors
+If you encounter certificate-related errors:
+
+# Check certificate validity
+openssl x509 -in /etc/ssl/prometheus/prometheus.crt -text -noout
+
+# Verify certificate and key match
+openssl x509 -noout -modulus -in /etc/ssl/prometheus/prometheus.crt | openssl md5
+openssl rsa -noout -modulus -in /etc/ssl/prometheus/prometheus.key | openssl md5
+Issue 2: Authentication Not Working
+If authentication fails:
+
+# Check htpasswd file format
+sudo cat /etc/nginx/.htpasswd
+
+# Test password manually
+sudo htpasswd -v /etc/nginx/.htpasswd admin
+
+# Check Nginx error logs
+sudo tail -f /var/log/nginx/error.log
+Issue 3: Service Connection Issues
+If services cannot connect:
+
+# Check port availability
+sudo netstat -tlnp | grep -E "(9090|443|80)"
+
+# Check firewall status
+sudo ufw status
+
+# Test internal connections
+curl -k https://127.0.0.1:9090/metrics
+Issue 4: Nginx Configuration Errors
+If Nginx fails to start:
+
+# Test configuration syntax
+sudo nginx -t
+
+# Check Nginx logs
+sudo journalctl -u nginx -f
+
+# Verify file permissions
+ls -la /etc/ssl/prometheus/
+Security Best Practices Summary
+Key Security Measures Implemented
+Transport Layer Security (TLS)
+
+HTTPS encryption for all communications
+Strong cipher suites configuration
+Certificate-based authentication
+Authentication and Authorization
+
+Basic HTTP authentication
+Role-based access control (RBAC)
+Separate user roles with different permissions
+Network Security
+
+Reverse proxy configuration
+HTTP to HTTPS redirection
+Secure headers implementation
+Access Control
+
+Admin-only administrative endpoints
+Viewer access for queries and graphs
+Read-only access for basic metrics
+Production Recommendations
+For production environments, consider these additional security measures:
+
+Use CA-signed certificates instead of self-signed certificates
+Implement IP whitelisting for administrative access
+Use external authentication systems (LDAP, OAuth, etc.)
+Enable audit logging for all access attempts
+Implement rate limiting to prevent abuse
+Regular security updates for all components
+Network segmentation to isolate monitoring infrastructure
+Conclusion
+In this lab, you have successfully implemented comprehensive security measures for Prometheus monitoring infrastructure. You have accomplished the following key objectives:
+
+Security Implementation Achievements:
+
+HTTPS Configuration: You configured end-to-end encryption using TLS certificates, ensuring all data transmission between clients and Prometheus is secure and protected from eavesdropping.
+
+Authentication System: You implemented a robust authentication mechanism using HTTP Basic Authentication with encrypted password storage, preventing unauthorized access to monitoring data.
+
+Role-Based Access Control: You established a multi-tier RBAC system with different user roles (admin, viewer, readonly), each with appropriate permissions for their responsibilities.
+
+Reverse Proxy Security: You deployed Nginx as a security-focused reverse proxy, adding an additional layer of protection and enabling advanced access control features.
+
+Certificate Management: You learned to generate, configure, and manage SSL certificates for secure communications in monitoring environments.
+
+Why This Matters:
+
+Securing monitoring infrastructure is critical because:
+
+Sensitive Data Protection: Monitoring systems collect detailed information about infrastructure, applications, and business metrics that could be valuable to attackers
+Compliance Requirements: Many industries require encrypted communications and access controls for monitoring data
+Operational Security: Unsecured monitoring systems can become entry points for attackers to gain insights into your infrastructure
+Data Integrity: Authentication ensures that only authorized users can view or modify monitoring configurations and data
+Real-World Applications:
+
+The security measures you implemented in this lab are directly applicable to:
+
+Production monitoring environments in enterprise settings
+Cloud-based monitoring solutions requiring secure access
+Compliance-driven environments (healthcare, finance, government)
+Multi-tenant monitoring platforms
+DevOps pipelines requiring secure metrics collection
+You now have the practical skills to deploy and maintain secure Prometheus monitoring infrastructure that meets enterprise security standards while maintaining the functionality and performance required for effective system monitoring.
