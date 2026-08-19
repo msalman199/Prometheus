@@ -1,0 +1,486 @@
+Advanced Alerting Strategies
+Objectives
+Design and deploy a complete observability stack (Prometheus, Alertmanager, Node Exporter) from scratch on a bare Ubuntu instance
+Implement multi-condition PromQL alerting rules that fire only when two or more system metrics breach thresholds simultaneously
+Build an alert routing topology in Alertmanager that delivers notifications to different receivers based on severity and alert type, and suppresses redundant alerts using inhibition rules
+Prerequisites
+Comfort with the Linux command line: navigating the filesystem, editing files with a terminal editor, and managing systemd services
+Familiarity with YAML syntax and the concept of key-value configuration files
+Basic understanding of what CPU, memory, and disk metrics represent in an operating system context
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Install and Verify the Monitoring Stack
+Requirement 1
+Design an installation procedure that places Prometheus (v2.47.0), Node Exporter (v1.6.1), and Alertmanager (v0.26.0) as running systemd services on the instance. Each binary must run under a dedicated non-login system user. All configuration files must be owned by their respective service users and readable only by those users (mode 640 or stricter).
+
+# Step 1 â System update and runtime dependencies
+sudo apt-get update -y && sudo apt-get install -y wget curl tar python3 stress-ng net-tools
+# Step 2 â Download Prometheus
+cd /tmp
+wget -fsSL https://github.com/prometheus/prometheus/releases/download/v2.47.0/prometheus-2.47.0.linux-amd64.tar.gz \
+  -O prometheus.tar.gz
+# Official installation guide: https://prometheus.io/docs/prometheus/latest/installation/
+
+tar xzf prometheus.tar.gz
+sudo useradd --no-create-home --shell /bin/false prometheus
+sudo mkdir -p /opt/prometheus /etc/prometheus /var/lib/prometheus
+sudo cp prometheus-2.47.0.linux-amd64/prometheus /opt/prometheus/
+sudo cp prometheus-2.47.0.linux-amd64/promtool /opt/prometheus/
+sudo cp -r prometheus-2.47.0.linux-amd64/consoles /opt/prometheus/
+sudo cp -r prometheus-2.47.0.linux-amd64/console_libraries /opt/prometheus/
+sudo chown -R prometheus:prometheus /opt/prometheus /etc/prometheus /var/lib/prometheus
+Troubleshoot this step:
+
+You may see: ERROR: The requested URL returned error: 404 if the release URL has changed.
+Visit https://github.com/prometheus/prometheus/releases and copy the current amd64 tarball URL, then re-run the wget command with the updated URL.
+Official guide: https://prometheus.io/docs/prometheus/latest/installation/
+# Step 3 â Download Node Exporter
+cd /tmp
+wget -fsSL https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz \
+  -O node_exporter.tar.gz
+# Official installation guide: https://prometheus.io/docs/guides/node-exporter/
+
+tar xzf node_exporter.tar.gz
+sudo cp node_exporter-1.6.1.linux-amd64/node_exporter /opt/prometheus/
+Troubleshoot this step:
+
+You may see: node_exporter: No such file or directory after extraction if the archive name changed between releases.
+Run tar tzf node_exporter.tar.gz | head to confirm the directory name inside the archive, then adjust the cp path accordingly.
+Official guide: https://prometheus.io/docs/guides/node-exporter/
+# Step 4 â Download Alertmanager
+cd /tmp
+wget -fsSL https://github.com/prometheus/alertmanager/releases/download/v0.26.0/alertmanager-0.26.0.linux-amd64.tar.gz \
+  -O alertmanager.tar.gz
+# Official installation guide: https://prometheus.io/docs/alerting/latest/alertmanager/
+
+tar xzf alertmanager.tar.gz
+sudo useradd --no-create-home --shell /bin/false alertmanager
+sudo mkdir -p /opt/alertmanager /etc/alertmanager /var/lib/alertmanager
+sudo cp alertmanager-0.26.0.linux-amd64/alertmanager /opt/alertmanager/
+sudo cp alertmanager-0.26.0.linux-amd64/amtool /opt/alertmanager/
+sudo chown -R alertmanager:alertmanager /opt/alertmanager /etc/alertmanager /var/lib/alertmanager
+Troubleshoot this step:
+
+You may see: tar: alertmanager-0.26.0.linux-amd64: Not found in archive if the version string in the directory differs from the tarball name.
+Run tar tzf alertmanager.tar.gz | head to find the actual directory name, then update the cp command to match.
+Official guide: https://prometheus.io/docs/alerting/latest/alertmanager/
+# Step 5 â Create systemd unit for Node Exporter
+sudo tee /etc/systemd/system/node_exporter.service <<'EOF'
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/opt/prometheus/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# Step 6 â Create systemd unit for Prometheus
+sudo tee /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/opt/prometheus/prometheus \
+    --config.file=/etc/prometheus/prometheus.yml \
+    --storage.tsdb.path=/var/lib/prometheus/ \
+    --web.console.templates=/opt/prometheus/consoles \
+    --web.console.libraries=/opt/prometheus/console_libraries \
+    --web.listen-address=0.0.0.0:9090 \
+    --web.enable-lifecycle
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# Step 7 â Create systemd unit for Alertmanager
+sudo tee /etc/systemd/system/alertmanager.service <<'EOF'
+[Unit]
+Description=Alertmanager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=alertmanager
+Group=alertmanager
+Type=simple
+ExecStart=/opt/alertmanager/alertmanager \
+    --config.file=/etc/alertmanager/alertmanager.yml \
+    --storage.path=/var/lib/alertmanager/ \
+    --web.listen-address=0.0.0.0:9093
+
+[Install]
+WantedBy=multi-user.target
+EOF
+Troubleshoot this step:
+
+You may see: Failed to start Prometheus: No such file or directory if the ExecStart path is wrong.
+Confirm the binary exists with ls -l /opt/prometheus/prometheus before starting the service; if missing, repeat Step 2.
+Official guide: https://prometheus.io/docs/prometheus/latest/installation/
+Requirement 2
+Design a minimal but valid baseline configuration for Prometheus that scrapes both itself and Node Exporter every 15 seconds, references an external alert rules file, and points to Alertmanager on port 9093. Then start all three services and confirm each one is reachable via its HTTP API.
+
+# Step 1 â Write baseline Prometheus configuration
+sudo tee /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - localhost:9093
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+EOF
+
+sudo chown prometheus:prometheus /etc/prometheus/prometheus.yml
+sudo chmod 640 /etc/prometheus/prometheus.yml
+# Step 2 â Write a placeholder alert rules file so Prometheus starts cleanly
+sudo tee /etc/prometheus/alert_rules.yml <<'EOF'
+groups: []
+EOF
+
+sudo chown prometheus:prometheus /etc/prometheus/alert_rules.yml
+sudo chmod 640 /etc/prometheus/alert_rules.yml
+# Step 3 â Write a minimal Alertmanager configuration
+sudo tee /etc/alertmanager/alertmanager.yml <<'EOF'
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'webhook-default'
+
+receivers:
+  - name: 'webhook-default'
+    webhook_configs:
+      - url: 'http://localhost:5001/alerts'
+        send_resolved: true
+
+inhibit_rules: []
+EOF
+
+sudo chown alertmanager:alertmanager /etc/alertmanager/alertmanager.yml
+sudo chmod 640 /etc/alertmanager/alertmanager.yml
+# Step 4 â Enable and start all services
+sudo systemctl daemon-reload
+sudo systemctl enable --now node_exporter prometheus alertmanager
+# Step 5 â Verify all three HTTP endpoints respond
+curl -fsSL http://localhost:9090/api/v1/status/buildinfo | python3 -m json.tool
+curl -fsSL http://localhost:9100/metrics | head -5
+curl -fsSL http://localhost:9093/api/v1/status | python3 -m json.tool
+Troubleshoot this step:
+
+You may see: curl: (7) Failed to connect to localhost port 9090: Connection refused if the service did not start.
+Run sudo journalctl -u prometheus -n 30 --no-pager to read the startup error; the most common cause is a YAML syntax error in prometheus.yml â validate it with /opt/prometheus/promtool check config /etc/prometheus/prometheus.yml.
+Official guide: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+Acceptance Criteria â Task 1
+
+sudo systemctl is-active node_exporter prometheus alertmanager returns active for all three services, and curl -fsSL http://localhost:9090/api/v1/targets returns a JSON response listing two targets (prometheus and node) both in state "up".
+/opt/prometheus/promtool check config /etc/prometheus/prometheus.yml exits with code 0 and prints SUCCESS, and all configuration files under /etc/prometheus/ and /etc/alertmanager/ are owned by their respective service users with permissions no broader than 640.
+Task 2: Implement Multi-Condition Alerting Rules
+Requirement 1
+Design and write a PromQL-based alert rules file that covers four distinct alert scenarios: (a) CPU usage alone above 80 percent for two minutes labeled severity: warning; (b) CPU usage alone above 95 percent for one minute labeled severity: critical; (c) a composite alert that fires only when CPU usage exceeds 70 percent AND memory usage exceeds 70 percent simultaneously for three minutes, labeled severity: warning, alert_type: composite; (d) a predictive alert using predict_linear that fires when the current disk usage trend projects the filesystem will be full within 24 hours, labeled severity: warning, alert_type: predictive. Each alert must include summary and description annotation fields that embed the instance label and current metric value using Go template syntax.
+
+# Step 1 â Write the full alert rules file
+sudo tee /etc/prometheus/alert_rules.yml <<'EOF'
+groups:
+  - name: cpu_alerts
+    rules:
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 2m
+        labels:
+          severity: warning
+          service: system
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | printf \"%.1f\" }}%, above the 80% threshold for over 2 minutes."
+
+      - alert: CriticalCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 95
+        for: 1m
+        labels:
+          severity: critical
+          service: system
+        annotations:
+          summary: "Critical CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | printf \"%.1f\" }}%, above the 95% threshold for over 1 minute."
+
+  - name: composite_alerts
+    rules:
+      - alert: SystemUnderStress
+        expr: |
+          (
+            100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 70
+          )
+          and
+          (
+            (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 70
+          )
+        for: 3m
+        labels:
+          severity: warning
+          service: system
+          alert_type: composite
+        annotations:
+          summary: "System under stress on {{ $labels.instance }}"
+          description: "Both CPU and memory usage have exceeded 70% simultaneously for more than 3 minutes on {{ $labels.instance }}."
+
+  - name: predictive_alerts
+    rules:
+      - alert: DiskSpaceRunningOut
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!="tmpfs"}[6h], 86400) < 0
+        for: 10m
+        labels:
+          severity: warning
+          service: storage
+          alert_type: predictive
+        annotations:
+          summary: "Disk space exhaustion predicted on {{ $labels.instance }}"
+          description: "Filesystem {{ $labels.mountpoint }} on {{ $labels.instance }} is projected to run out of space within 24 hours based on the current 6-hour usage trend."
+EOF
+
+sudo chown prometheus:prometheus /etc/prometheus/alert_rules.yml
+sudo chmod 640 /etc/prometheus/alert_rules.yml
+# Step 2 â Validate the rules file before reloading
+/opt/prometheus/promtool check rules /etc/prometheus/alert_rules.yml
+Troubleshoot this step:
+
+You may see: FAILED: parsing error at char X: unexpected character if a Go template brace or YAML special character is unescaped.
+Open the file with a terminal editor, locate the line number reported by promtool, and ensure all $ signs inside double-quoted YAML strings are escaped as \$, or switch the annotation value to a single-quoted YAML block scalar.
+Official guide: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+# Step 3 â Reload Prometheus to apply the new rules
+curl -fsSL -X POST http://localhost:9090/-/reload
+# Confirm rules loaded
+curl -fsSL http://localhost:9090/api/v1/rules | python3 -m json.tool | grep '"name"'
+Requirement 2
+Design a controlled load generation procedure using stress-ng that drives CPU usage above 80 percent and memory usage above 70 percent on the instance at the same time for at least five minutes. While the load runs, poll the Prometheus alerts API every 30 seconds and capture the moment each alert transitions from pending to firing. Record the exact timestamp and alert name for each transition.
+
+# Step 1 â Start CPU and memory stress in the background
+stress-ng --cpu 4 --timeout 360s &
+STRESS_CPU_PID=$!
+stress-ng --vm 2 --vm-bytes 75% --timeout 360s &
+STRESS_MEM_PID=$!
+echo "Stress processes started: CPU PID=${STRESS_CPU_PID}, MEM PID=${STRESS_MEM_PID}"
+# Step 2 â Poll Prometheus alerts API every 30 seconds for 6 minutes
+for i in $(seq 1 12); do
+  echo "=== Poll ${i} at $(date '+%Y-%m-%d %H:%M:%S') ==="
+  curl -fsSL http://localhost:9090/api/v1/alerts | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+alerts = data.get('data', {}).get('alerts', [])
+if not alerts:
+    print('  No active alerts')
+for a in alerts:
+    print('  Alert:', a['labels'].get('alertname'),
+          '| State:', a['state'],
+          '| Severity:', a['labels'].get('severity', 'n/a'),
+          '| ActiveAt:', a.get('activeAt', 'n/a'))
+"
+  sleep 30
+done
+Troubleshoot this step:
+
+You may see: stress-ng: error: invalid argument '75%' for '--vm-bytes' on some Ubuntu versions that do not accept percentage notation.
+Replace 75% with an absolute byte value such as 1G and re-run the command.
+Official guide: https://github.com/ColinIanKing/stress-ng
+Acceptance Criteria â Task 2
+
+/opt/prometheus/promtool check rules /etc/prometheus/alert_rules.yml exits with code 0, and curl -fsSL http://localhost:9090/api/v1/rules returns all four alert rule names (HighCPUUsage, CriticalCPUUsage, SystemUnderStress, DiskSpaceRunningOut) with "type": "alerting" in the JSON response.
+During the stress test, at least one alert reaches state "firing" as confirmed by the polling output, and the SystemUnderStress composite alert appears in the firing state within five minutes of both CPU and memory thresholds being breached simultaneously.
+Task 3: Build Alert Routing, Inhibition, and a Webhook Receiver
+Requirement 1
+Design and implement a Python-based HTTP webhook server that listens on port 5001, accepts POST requests from Alertmanager, parses the JSON payload, and prints a structured summary to stdout for each received alert showing: alert name, status (firing or resolved), severity, instance, summary annotation, and the UTC timestamp of receipt. The server must remain running as a background process for the duration of this task.
+
+# Step 1 â Write the webhook server
+cat > /tmp/webhook_server.py <<'PYEOF'
+#!/usr/bin/env python3
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime, timezone
+
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length)
+        try:
+            payload = json.loads(body.decode('utf-8'))
+            ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            print(f"\n{'='*60}")
+            print(f"Webhook received at {ts}  endpoint={self.path}")
+            for alert in payload.get('alerts', []):
+                labels = alert.get('labels', {})
+                annotations = alert.get('annotations', {})
+                print(f"  alertname : {labels.get('alertname', 'unknown')}")
+                print(f"  status    : {alert.get('status', 'unknown')}")
+                print(f"  severity  : {labels.get('severity', 'unknown')}")
+                print(f"  instance  : {labels.get('instance', 'unknown')}")
+                print(f"  summary   : {annotations.get('summary', 'none')}")
+                print(f"  ---")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        except Exception as exc:
+            print(f"Parse error: {exc}")
+            self.send_response(400)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+HTTPServer(('0.0.0.0', 5001), WebhookHandler).serve_forever()
+PYEOF
+
+chmod +x /tmp/webhook_server.py
+# Step 2 â Start the webhook server in the background and confirm it is listening
+python3 /tmp/webhook_server.py > /tmp/webhook_server.log 2>&1 &
+WEBHOOK_PID=$!
+echo "Webhook server PID: ${WEBHOOK_PID}"
+sleep 2
+curl -fsSL -X POST http://localhost:5001/test \
+  -H 'Content-Type: application/json' \
+  -d '{"alerts":[{"labels":{"alertname":"TestAlert","severity":"info","instance":"localhost"},"annotations":{"summary":"Connectivity test"},"status":"firing"}]}'
+Troubleshoot this step:
+
+You may see: curl: (7) Failed to connect to localhost port 5001 if the Python process exited immediately.
+Run cat /tmp/webhook_server.log to read the Python traceback; the most common cause is port 5001 already in use â identify the occupying process with sudo ss -tlnp | grep 5001 and stop it before restarting the server.
+Python HTTPServer documentation: https://docs.python.org/3/library/http.server.html
+Requirement 2
+Design an Alertmanager routing configuration that satisfies all five of the following constraints simultaneously, then trigger a firing alert and confirm the webhook server receives the notification:
+
+Alerts labeled severity: critical must be routed to a receiver named critical-team with a group_wait of 5 seconds and a repeat_interval of 5 minutes.
+Alerts labeled severity: warning must be routed to a receiver named warning-team with a repeat_interval of 2 hours.
+Alerts labeled alert_type: predictive must be routed to a receiver named capacity-planning with a repeat_interval of 6 hours, regardless of severity.
+An inhibition rule must suppress all severity: warning alerts on the same instance whenever a severity: critical alert is already firing on that instance.
+A second inhibition rule must suppress all alerts labeled alert_type: predictive on the same instance whenever any alert labeled alert_type: composite is firing on that instance.
+All three named receivers must point to the webhook server on port 5001 at distinct URL paths (/critical, /warning, /capacity).
+
+# Step 1 â Write the advanced Alertmanager configuration
+sudo tee /etc/alertmanager/alertmanager.yml <<'EOF'
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'instance']
+  group_wait: 30s
+  group_interval: 10s
+  repeat_interval: 12h
+  receiver: 'default'
+  routes:
+    - match:
+        alert_type: predictive
+      receiver: 'capacity-planning'
+      repeat_interval: 6h
+
+    - match:
+        severity: critical
+      receiver: 'critical-team'
+      group_wait: 5s
+      repeat_interval: 5m
+
+    - match:
+        severity: warning
+      receiver: 'warning-team'
+      repeat_interval: 2h
+
+receivers:
+  - name: 'default'
+    webhook_configs:
+      - url: 'http://localhost:5001/alerts'
+        send_resolved: true
+
+  - name: 'critical-team'
+    webhook_configs:
+      - url: 'http://localhost:5001/critical'
+        send_resolved: true
+
+  - name: 'warning-team'
+    webhook_configs:
+      - url: 'http://localhost:5001/warning'
+        send_resolved: true
+
+  - name: 'capacity-planning'
+    webhook_configs:
+      - url: 'http://localhost:5001/capacity'
+        send_resolved: true
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['instance']
+
+  - source_match:
+      alert_type: 'composite'
+    target_match:
+      alert_type: 'predictive'
+    equal: ['instance']
+EOF
+
+sudo chown alertmanager:alertmanager /etc/alertmanager/alertmanager.yml
+sudo chmod 640 /etc/alertmanager/alertmanager.yml
+# Step 2 â Validate the Alertmanager configuration
+/opt/alertmanager/amtool check-config /etc/alertmanager/alertmanager.yml
+Troubleshoot this step:
+
+You may see: level=error msg="error checking config" err="yaml: line X: did not find expected key" if a YAML indentation error exists.
+Open the file and verify that every routes: list item is indented exactly two spaces more than its parent route: block; YAML does not accept tab characters.
+Official guide: https://prometheus.io/docs/alerting/latest/configuration/
+# Step 3 â Reload Alertmanager with the new configuration
+sudo systemctl restart alertmanager
+sleep 3
+curl -fsSL http://localhost:9093/api/v1/status | python3 -m json.tool | grep '"configHash"'
+# Step 4 â Confirm routing by inspecting the Alertmanager routing tree
+/opt/alertmanager/amtool config routes --alertmanager.url=http://localhost:9093
+# Step 5 â Trigger a firing alert by temporarily lowering the HighCPUUsage threshold to 1%
+# and reloading, then watch the webhook server log for the incoming notification
+sudo sed -i 's/> 80/> 1/' /etc/prometheus/alert_rules.yml
+curl -fsSL -X POST http://localhost:9090/-/reload
+echo "Waiting 90 seconds for alert to reach 'firing' state..."
+sleep 90
+curl -fsSL http://localhost:9093/api/v1/alerts | python3 -m json.tool | grep -E '"alertname"|"status"|"receiver"'
+cat /tmp/webhook_server.log
+# Step 6 â Restore the original threshold and reload
+sudo sed -i 's/> 1/> 80/' /etc/prometheus/alert_rules.yml
+curl -fsSL -X POST http://localhost:9090/-/reload
+Troubleshoot this step:
+
+You may see: curl: (22) The requested URL returned error: 405 when posting to the reload endpoint if --web.enable-lifecycle is missing from the Prometheus ExecStart line.
+Verify the flag is present with sudo systemctl cat prometheus | grep lifecycle; if absent, add it to the unit file, then run sudo systemctl daemon-reload && sudo systemctl restart prometheus.
+Official guide: https://prometheus.io/docs/prometheus/latest/management_api/
+Acceptance Criteria â Task 3
+
+/opt/alertmanager/amtool check-config /etc/alertmanager/alertmanager.yml exits with code 0, and amtool config routes --alertmanager.url=http://localhost:9093 displays all three named receivers (critical-team, warning-team, capacity-planning) in the routing tree output.
+After lowering the HighCPUUsage threshold to 1 percent and waiting 90 seconds, cat /tmp/webhook_server.log shows at least one POST to /warning containing the HighCPUUsage alert name and "status": "firing", confirming the end-to-end pipeline from Prometheus rule evaluation through Alertmanager routing to webhook delivery.
+Expected Outcomes
+A fully operational three-component monitoring pipeline (Prometheus, Alertmanager, Node Exporter) running as systemd services, with validated configuration files and confirmed metric ingestion from the local host.
+A working alert lifecycle demonstration: PromQL rules evaluate against live metrics, alerts transition from pending to firing, Alertmanager routes them to the correct webhook receiver based on severity and alert type, and inhibition rules suppress redundant notifications as configured.
+Conclusion
+This lab required you to build a production-grade alerting pipeline entirely from first principles, making every architectural decision yourself. The multi-condition PromQL expressions and Alertmanager inhibition rules you designed reflect the core techniques used to reduce alert fatigue in real high-traffic systems. Extend this foundation by integrating a persistent notification channel such as PagerDuty or Slack, and by adding recording rules to pre-compute expensive PromQL expressions for faster evaluation at scale.
